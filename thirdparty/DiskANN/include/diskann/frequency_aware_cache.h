@@ -3,6 +3,8 @@
 
 #pragma once
 
+#ifdef KNOWHERE_WITH_PAGEANN
+
 #include <vector>
 #include <mutex>
 #include <shared_mutex>
@@ -420,3 +422,5 @@ void FrequencyAwareCache<T>::free_coord_slot(size_t slot_idx) {
 }
 
 }  // namespace diskann
+
+#endif  // KNOWHERE_WITH_PAGEANN

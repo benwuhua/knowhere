@@ -3,6 +3,8 @@
 
 #pragma once
 
+#ifdef KNOWHERE_WITH_PAGEANN
+
 #include <vector>
 #include <queue>
 #include <mutex>
@@ -461,3 +463,5 @@ PrefetchBuffer<T>::merge_continuous_ids(
 }
 
 }  // namespace diskann
+
+#endif  // KNOWHERE_WITH_PAGEANN

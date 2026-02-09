@@ -12,6 +12,8 @@
 #ifndef PAGEANN_CONFIG_H
 #define PAGEANN_CONFIG_H
 
+#ifdef KNOWHERE_WITH_PAGEANN
+
 #include "diskann_config.h"
 
 namespace knowhere {
@@ -160,4 +162,7 @@ class PageANNConfig : public DiskANNConfig {
 };
 
 }  // namespace knowhere
+
+#endif  // KNOWHERE_WITH_PAGEANN
+
 #endif /* PAGEANN_CONFIG_H */

@@ -27,6 +27,7 @@ class KnowhereConan(ConanFile):
         "with_cuvs": [True, False],
         "with_asan": [True, False],
         "with_diskann": [True, False],
+        "with_pageann": [True, False],
         "with_cardinal": [True, False],
         "with_profiler": [True, False],
         "with_ut": [True, False],
@@ -42,6 +43,7 @@ class KnowhereConan(ConanFile):
         "with_cuvs": False,
         "with_asan": False,
         "with_diskann": False,
+        "with_pageann": False,
         "with_cardinal": False,
         "with_profiler": False,
         "with_ut": False,
@@ -94,6 +96,10 @@ class KnowhereConan(ConanFile):
     def configure(self):
         if self.options.shared:
             self.options.rm_safe("fPIC")
+        # PageANN requires DiskANN
+        if self.options.get_safe("with_pageann") and not self.options.with_diskann:
+            self.output.warn("PageANN requires DiskANN. Enabling with_diskann.")
+            self.options.with_diskann = True
 
     def requirements(self):
         self.requires("boost/1.83.0")
@@ -176,6 +182,7 @@ class KnowhereConan(ConanFile):
             tc.variables["MSVC_USE_STATIC_RUNTIME"] = "MT" in msvc_runtime_flag(self)
         tc.variables["WITH_ASAN"] = self.options.with_asan
         tc.variables["WITH_DISKANN"] = self.options.with_diskann
+        tc.variables["WITH_PAGEANN"] = self.options.get_safe("with_pageann", False)
         tc.variables["WITH_CARDINAL"] = self.options.with_cardinal
         tc.variables["WITH_CUVS"] = self.options.with_cuvs
         tc.variables["WITH_PROFILER"] = self.options.with_profiler

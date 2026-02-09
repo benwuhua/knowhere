@@ -12,6 +12,8 @@
 #ifndef PAGEANN_H
 #define PAGEANN_H
 
+#ifdef KNOWHERE_WITH_PAGEANN
+
 #include <memory>
 #include "knowhere/index/index_node.h"
 #include "diskann/prefetch_buffer.h"
@@ -134,5 +136,7 @@ class PageANNIndexNode : public DiskANNIndexNode<DataType> {
 };
 
 }  // namespace knowhere
+
+#endif  // KNOWHERE_WITH_PAGEANN
 
 #endif /* PAGEANN_H */

@@ -1003,6 +1003,7 @@ DiskANNIndexNode<DataType>::GetCachedNodeNum(const float cache_dram_budget, cons
     return num_nodes_to_cache;
 }
 
+#ifdef KNOWHERE_WITH_PAGEANN
 // ============================================================================
 // PageANN Index Node - Enhanced DiskANN with Stage 1 optimizations
 // ============================================================================
@@ -1195,6 +1196,8 @@ template class PageANNIndexNode<knowhere::bf16>;
 // Register PAGEANN index
 KNOWHERE_SIMPLE_REGISTER_DENSE_FLOAT_ALL_GLOBAL(PAGEANN, PageANNIndexNode,
                                                 knowhere::feature::DISK | knowhere::feature::EMB_LIST)
+
+#endif  // KNOWHERE_WITH_PAGEANN
 
 #ifdef KNOWHERE_WITH_CARDINAL
 KNOWHERE_SIMPLE_REGISTER_DENSE_FLOAT_ALL_GLOBAL(DISKANN_DEPRECATED, DiskANNIndexNode,
