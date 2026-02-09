@@ -108,6 +108,11 @@ static std::set<std::pair<std::string, VecType>> legal_knowhere_index = {
     {IndexEnum::INDEX_AISAQ, VecType::VECTOR_FLOAT16},
     {IndexEnum::INDEX_AISAQ, VecType::VECTOR_BFLOAT16},
 
+    // pageann
+    {IndexEnum::INDEX_PAGEANN, VecType::VECTOR_FLOAT},
+    {IndexEnum::INDEX_PAGEANN, VecType::VECTOR_FLOAT16},
+    {IndexEnum::INDEX_PAGEANN, VecType::VECTOR_BFLOAT16},
+
     // sparse index
     {IndexEnum::INDEX_SPARSE_INVERTED_INDEX, VecType::VECTOR_SPARSE_FLOAT},
     {IndexEnum::INDEX_SPARSE_WAND, VecType::VECTOR_SPARSE_FLOAT},
@@ -149,6 +154,7 @@ static std::set<std::string> legal_support_emb_list_knowhere_index = {
     IndexEnum::INDEX_FAISS_IVFFLAT,
     IndexEnum::INDEX_FAISS_IVFFLAT_CC,
     IndexEnum::INDEX_DISKANN,
+    IndexEnum::INDEX_PAGEANN,
 #ifdef KNOWHERE_WITH_CARDINAL
     IndexEnum::INDEX_CARDINAL_TIERED,
 #endif

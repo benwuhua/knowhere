@@ -59,6 +59,7 @@ constexpr const char* INDEX_HNSW_PRQ = "HNSW_PRQ";
 
 constexpr const char* INDEX_DISKANN = "DISKANN";
 constexpr const char* INDEX_AISAQ = "AISAQ";
+constexpr const char* INDEX_PAGEANN = "PAGEANN";
 constexpr const char* INDEX_MINHASH_LSH = "MINHASH_LSH";
 
 constexpr const char* INDEX_SPARSE_INVERTED_INDEX = "SPARSE_INVERTED_INDEX";
@@ -193,6 +194,15 @@ constexpr const char* INLINE_PQ = "inline_pq";
 constexpr const char* PQ_CACHE_SIZE = "pq_cache_size";
 constexpr const char* PQ_READ_PAGE_CACHE_SIZE = "pq_read_page_cache_size";
 constexpr const char* VECTORS_BEAMWIDTH = "vectors_beamwidth";
+
+// PAGEANN Params
+constexpr const char* PREFETCH_BATCH_SIZE = "prefetch_batch_size";
+constexpr const char* PREFETCH_BUFFER_MB = "prefetch_buffer_mb";
+constexpr const char* PREFETCH_LOOKAHEAD_RATIO = "prefetch_lookahead_ratio";
+constexpr const char* ENABLE_FREQUENCY_AWARE_CACHE = "enable_frequency_aware_cache";
+constexpr const char* FREQUENCY_CACHE_BUDGET_GB = "frequency_cache_budget_gb";
+constexpr const char* CACHE_DECAY_INTERVAL = "cache_decay_interval";
+constexpr const char* CACHE_DECAY_FACTOR = "cache_decay_factor";
 
 // FAISS additional Params
 constexpr const char* HNSW_REFINE = "refine";

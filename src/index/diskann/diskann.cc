@@ -1003,6 +1003,199 @@ DiskANNIndexNode<DataType>::GetCachedNodeNum(const float cache_dram_budget, cons
     return num_nodes_to_cache;
 }
 
+// ============================================================================
+// PageANN Index Node - Enhanced DiskANN with Stage 1 optimizations
+// ============================================================================
+
+template <typename DataType>
+class PageANNIndexNode : public DiskANNIndexNode<DataType> {
+    static_assert(KnowhereFloatTypeCheck<DataType>::value,
+                  "PageANN only support floating point data type(float32, float16, bfloat16)");
+
+ public:
+    using DistType = float;
+
+    PageANNIndexNode(const int32_t& version, const Object& object)
+        : DiskANNIndexNode<DataType>(version, object),
+          enable_prefetch_(true),
+          enable_freq_aware_cache_(true),
+          prefetch_batch_size_(16),
+          prefetch_lookahead_ratio_(2.0f),
+          frequency_cache_budget_gb_(0.1f),
+          cache_decay_interval_(10000),
+          cache_decay_factor_(0.99f),
+          optimizations_initialized_(false) {
+        LOG_KNOWHERE_INFO_ << "PageANNIndexNode constructed";
+    }
+
+    ~PageANNIndexNode() override {
+        cleanup_optimizations();
+        LOG_KNOWHERE_INFO_ << "PageANNIndexNode destroyed";
+    }
+
+    Status
+    Deserialize(const BinarySet& binset, std::shared_ptr<Config> cfg) override {
+        auto pageann_conf = static_cast<const PageANNConfig&>(*cfg);
+
+        LOG_KNOWHERE_INFO_ << "PageANN Deserialize called with optimizations: "
+                           << "prefetch=" << pageann_conf.enable_frequency_aware_cache.value()
+                           << ", freq_cache=" << pageann_conf.enable_frequency_aware_cache.value();
+
+        // Call parent DiskANNIndexNode::Deserialize()
+        Status parent_status = DiskANNIndexNode<DataType>::Deserialize(binset, cfg);
+        if (parent_status != Status::success) {
+            LOG_KNOWHERE_ERROR_ << "Parent DiskANN Deserialize failed: " << static_cast<int>(parent_status);
+            return parent_status;
+        }
+
+        // Initialize PageANN optimizations
+        Status opt_status = initialize_optimizations(cfg);
+        if (opt_status != Status::success) {
+            LOG_KNOWHERE_ERROR_ << "Failed to initialize PageANN optimizations: "
+                                << static_cast<int>(opt_status);
+            return opt_status;
+        }
+
+        LOG_KNOWHERE_INFO_ << "PageANN Deserialize completed successfully";
+        return Status::success;
+    }
+
+    expected<DataSetPtr>
+    Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
+           milvus::OpContext* op_context) const override {
+        // For initial implementation, delegate to parent
+        LOG_KNOWHERE_DEBUG_ << "PageANN Search called (delegating to DiskANN)";
+        return DiskANNIndexNode<DataType>::Search(dataset, std::move(cfg), bitset, op_context);
+    }
+
+ private:
+    // PageANN optimization components
+    mutable std::unique_ptr<diskann::PrefetchBuffer<DataType>> prefetch_buffer_;
+    mutable std::unique_ptr<diskann::FrequencyAwareCache<DataType>> freq_aware_cache_;
+
+    bool enable_prefetch_;
+    bool enable_freq_aware_cache_;
+    uint32_t prefetch_batch_size_;
+    float prefetch_lookahead_ratio_;
+    float frequency_cache_budget_gb_;
+    uint32_t cache_decay_interval_;
+    float cache_decay_factor_;
+    bool optimizations_initialized_;
+
+    Status initialize_optimizations(std::shared_ptr<Config> cfg) {
+        if (optimizations_initialized_) {
+            LOG_KNOWHERE_INFO_ << "PageANN optimizations already initialized";
+            return Status::success;
+        }
+
+        auto pageann_conf = static_cast<const PageANNConfig&>(*cfg);
+
+        enable_prefetch_ = pageann_conf.enable_frequency_aware_cache.has_value()
+                           ? pageann_conf.enable_frequency_aware_cache.value()
+                           : true;
+        enable_freq_aware_cache_ = pageann_conf.enable_frequency_aware_cache.has_value()
+                                   ? pageann_conf.enable_frequency_aware_cache.value()
+                                   : true;
+
+        prefetch_batch_size_ = pageann_conf.prefetch_batch_size.has_value()
+                              ? pageann_conf.prefetch_batch_size.value()
+                              : 16;
+
+        auto prefetch_buffer_mb = pageann_conf.prefetch_buffer_mb.has_value()
+                              ? pageann_conf.prefetch_buffer_mb.value()
+                              : 256;
+
+        prefetch_lookahead_ratio_ = pageann_conf.prefetch_lookahead_ratio.has_value()
+                                    ? pageann_conf.prefetch_lookahead_ratio.value()
+                                    : 2.0f;
+
+        frequency_cache_budget_gb_ = pageann_conf.frequency_cache_budget_gb.has_value()
+                                      ? pageann_conf.frequency_cache_budget_gb.value()
+                                      : 0.1f;
+
+        cache_decay_interval_ = pageann_conf.cache_decay_interval.has_value()
+                                 ? pageann_conf.cache_decay_interval.value()
+                                 : 10000;
+
+        cache_decay_factor_ = pageann_conf.cache_decay_factor.has_value()
+                              ? pageann_conf.cache_decay_factor.value()
+                              : 0.99f;
+
+        // Initialize PrefetchBuffer
+        if (enable_prefetch_) {
+            try {
+                size_t node_size = 4096;  // Typical sector size
+                prefetch_buffer_ = std::make_unique<diskann::PrefetchBuffer<DataType>>(
+                    prefetch_buffer_mb * 1024 * 1024,
+                    node_size
+                );
+                LOG_KNOWHERE_INFO_ << "PrefetchBuffer initialized: "
+                                   << prefetch_buffer_mb << " MB";
+            } catch (const std::exception& e) {
+                LOG_KNOWHERE_ERROR_ << "Failed to initialize PrefetchBuffer: " << e.what();
+                return Status::invalid_args;
+            }
+        }
+
+        // Initialize FrequencyAwareCache
+        if (enable_freq_aware_cache_) {
+            try {
+                size_t dim = this->Dim();
+                size_t max_degree = 64;
+                size_t neighborhood_bytes = (max_degree + 1) * sizeof(unsigned);
+                size_t coord_bytes = dim * sizeof(DataType);
+                size_t node_bytes = neighborhood_bytes + coord_bytes;
+
+                size_t total_bytes = static_cast<size_t>(frequency_cache_budget_gb_ * 1024 * 1024 * 1024);
+                size_t max_nodes = total_bytes / node_bytes;
+
+                freq_aware_cache_ = std::make_unique<diskann::FrequencyAwareCache<DataType>>(
+                    max_nodes,
+                    (max_degree + 1) * sizeof(unsigned),
+                    dim
+                );
+
+                freq_aware_cache_->set_decay_params(cache_decay_interval_, cache_decay_factor_);
+
+                LOG_KNOWHERE_INFO_ << "FrequencyAwareCache initialized: "
+                                   << max_nodes << " nodes, " << dim << " dims";
+            } catch (const std::exception& e) {
+                LOG_KNOWHERE_ERROR_ << "Failed to initialize FrequencyAwareCache: " << e.what();
+                return Status::invalid_args;
+            }
+        }
+
+        optimizations_initialized_ = true;
+        LOG_KNOWHERE_INFO_ << "PageANN optimizations initialized successfully";
+        return Status::success;
+    }
+
+    void cleanup_optimizations() {
+        if (prefetch_buffer_) {
+            prefetch_buffer_->wait_all();
+            prefetch_buffer_->clear();
+            prefetch_buffer_.reset();
+        }
+
+        if (freq_aware_cache_) {
+            freq_aware_cache_->clear();
+            freq_aware_cache_.reset();
+        }
+
+        optimizations_initialized_ = false;
+        LOG_KNOWHERE_INFO_ << "PageANN optimizations cleaned up";
+    }
+};
+
+// Explicit template instantiations for PageANNIndexNode
+template class PageANNIndexNode<knowhere::fp32>;
+template class PageANNIndexNode<knowhere::fp16>;
+template class PageANNIndexNode<knowhere::bf16>;
+
+// Register PAGEANN index
+KNOWHERE_SIMPLE_REGISTER_DENSE_FLOAT_ALL_GLOBAL(PAGEANN, PageANNIndexNode,
+                                                knowhere::feature::DISK | knowhere::feature::EMB_LIST)
+
 #ifdef KNOWHERE_WITH_CARDINAL
 KNOWHERE_SIMPLE_REGISTER_DENSE_FLOAT_ALL_GLOBAL(DISKANN_DEPRECATED, DiskANNIndexNode,
                                                 knowhere::feature::DISK | knowhere::feature::EMB_LIST)
