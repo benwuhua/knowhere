@@ -101,7 +101,7 @@ class KnowhereConan(ConanFile):
             self.options.with_diskann = True
 
     def requirements(self):
-        self.requires("boost/1.83.0@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
+        self.requires("boost/[>=1.82.0]@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("gflags/2.2.2@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("glog/0.6.0@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("nlohmann_json/3.11.2@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
@@ -109,7 +109,7 @@ class KnowhereConan(ConanFile):
         self.requires("prometheus-cpp/1.1.0@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("zlib/1.2.12@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("double-conversion/3.2.1@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
-        self.requires("xz_utils/5.2.5@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
+        self.requires("xz_utils/[>=5.2.5]@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("protobuf/3.21.4@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("fmt/9.1.0@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("folly/2023.10.30.10@cbu3rd.milvus/stable", transitive_headers=True, transitive_libs=True)
@@ -121,7 +121,7 @@ class KnowhereConan(ConanFile):
         if not self.options.with_light:
             self.requires("opentelemetry-cpp/1.8.1.1@cbu3rd.milvus/stable", transitive_headers=True, transitive_libs=True)
         if self.settings.os not in ["Macos", "Android"]:
-            self.requires("libunwind/1.7.2@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
+            self.requires("libunwind/[>=1.7.2]@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         if self.options.with_ut:
             self.requires("catch2/3.3.1@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         if self.options.with_benchmark:
