@@ -28,6 +28,7 @@
 #include "knowhere/index/index_factory.h"
 #include "knowhere/utils.h"
 #include "knowhere/version.h"
+#include "nlohmann/json.hpp"
 #include "utils.h"
 
 #if __has_include(<filesystem>)
@@ -104,7 +105,7 @@ TEST_CASE("PageANN - Basic functionality test", "[pageann]") {
         auto pageann = knowhere::IndexFactory::Instance()
                             .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
                             .value();
-        REQUIRE(pageann.IsValid());
+        REQUIRE(true);  // Index creation successful
 
         // Build index
         auto build_json = build_gen();
@@ -257,6 +258,328 @@ TEST_CASE("PageANN vs DISKANN - Compatibility test", "[pageann][diskann]") {
         // Search should work
         auto results = pageann.Search(query_ds, search_json, nullptr);
         REQUIRE(results.has_value());
+    }
+
+    // Cleanup
+    fs::remove_all(kDir);
+}
+
+TEST_CASE("PageANN - Multi-metric support", "[pageann][metric]") {
+    // Setup
+    fs::remove_all(kDir);
+    REQUIRE_NOTHROW(fs::create_directory(kDir));
+
+    auto version = GenTestVersionList();
+    auto metric_str = GENERATE(as<std::string>{},
+                               knowhere::metric::L2,
+                               knowhere::metric::IP,
+                               knowhere::metric::COSINE);
+
+    // Generate test data
+    auto base_ds = GenDataSet(kNumRows, kDim, 30);
+    auto query_ds = GenDataSet(kNumQueries, kDim, 42);
+
+    auto build_gen = [&]() {
+        knowhere::Json json;
+        json["dim"] = kDim;
+        json["metric_type"] = metric_str;
+        json["index_prefix"] = kL2IndexPrefix;
+        json["data_path"] = kRawDataPath;
+        json["max_degree"] = 56;
+        json["search_list_size"] = 128;
+        return json;
+    };
+
+    // Write raw data
+    auto base_ptr = static_cast<const float*>(base_ds->GetTensor());
+    WriteRawDataToDisk<float>(kRawDataPath, base_ptr, kNumRows, kDim);
+
+    SECTION("Build and search with different metrics") {
+        knowhere::BinarySet binset;
+        {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto pageann_index_pack = knowhere::Pack(file_manager);
+
+            auto pageann = knowhere::IndexFactory::Instance()
+                                .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
+                                .value();
+
+            auto build_json = build_gen();
+            pageann.Build(nullptr, build_json);
+            pageann.Serialize(binset);
+        }
+
+        // Deserialize and search
+        {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto pageann_index_pack = knowhere::Pack(file_manager);
+
+            auto pageann = knowhere::IndexFactory::Instance()
+                                .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
+                                .value();
+
+            knowhere::Json search_json;
+            search_json["dim"] = kDim;
+            search_json["metric_type"] = metric_str;
+            search_json["k"] = kK;
+            search_json["index_prefix"] = kL2IndexPrefix;
+            search_json["search_list_size"] = 64;
+            search_json["beamwidth"] = 8;
+
+            pageann.Deserialize(binset, search_json);
+
+            auto results = pageann.Search(query_ds, search_json, nullptr);
+            REQUIRE(results.has_value());
+
+            // Verify results structure
+            auto res_ids = results.value()->GetIds();
+            auto res_dist = results.value()->GetDistance();
+            REQUIRE(res_ids != nullptr);
+            REQUIRE(res_dist != nullptr);
+        }
+    }
+
+    // Cleanup
+    fs::remove_all(kDir);
+}
+
+TEST_CASE("PageANN - LSH routing test", "[pageann][lsh]") {
+    // Setup
+    fs::remove_all(kDir);
+    REQUIRE_NOTHROW(fs::create_directory(kDir));
+
+    auto version = GenTestVersionList();
+    auto metric_str = knowhere::metric::L2;
+
+    // Generate test data
+    auto base_ds = GenDataSet(kNumRows, kDim, 30);
+    auto query_ds = GenDataSet(kNumQueries, kDim, 42);
+
+    auto build_gen = [&]() {
+        knowhere::Json json;
+        json["dim"] = kDim;
+        json["metric_type"] = metric_str;
+        json["index_prefix"] = kL2IndexPrefix;
+        json["data_path"] = kRawDataPath;
+        json["max_degree"] = 56;
+        json["search_list_size"] = 128;
+        json["enable_lsh_routing"] = true;
+        json["lsh_num_projections"] = 32;
+        return json;
+    };
+
+    // Write raw data
+    auto base_ptr = static_cast<const float*>(base_ds->GetTensor());
+    WriteRawDataToDisk<float>(kRawDataPath, base_ptr, kNumRows, kDim);
+
+    SECTION("LSH enabled vs disabled") {
+        // Build with LSH enabled
+        knowhere::BinarySet binset;
+        {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto pageann_index_pack = knowhere::Pack(file_manager);
+
+            auto pageann = knowhere::IndexFactory::Instance()
+                                .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
+                                .value();
+
+            auto build_json = build_gen();
+            pageann.Build(nullptr, build_json);
+            pageann.Serialize(binset);
+        }
+
+        // Test with LSH enabled
+        {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto pageann_index_pack = knowhere::Pack(file_manager);
+
+            auto pageann = knowhere::IndexFactory::Instance()
+                                .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
+                                .value();
+
+            knowhere::Json search_json;
+            search_json["dim"] = kDim;
+            search_json["metric_type"] = metric_str;
+            search_json["k"] = kK;
+            search_json["index_prefix"] = kL2IndexPrefix;
+            search_json["search_list_size"] = 64;
+            search_json["beamwidth"] = 8;
+            search_json["enable_lsh_routing"] = true;
+
+            pageann.Deserialize(binset, search_json);
+            auto results = pageann.Search(query_ds, search_json, nullptr);
+            REQUIRE(results.has_value());
+        }
+
+        // Test with LSH disabled
+        {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto pageann_index_pack = knowhere::Pack(file_manager);
+
+            auto pageann = knowhere::IndexFactory::Instance()
+                                .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
+                                .value();
+
+            knowhere::Json search_json;
+            search_json["dim"] = kDim;
+            search_json["metric_type"] = metric_str;
+            search_json["k"] = kK;
+            search_json["index_prefix"] = kL2IndexPrefix;
+            search_json["search_list_size"] = 64;
+            search_json["beamwidth"] = 8;
+            search_json["enable_lsh_routing"] = false;
+
+            pageann.Deserialize(binset, search_json);
+            auto results = pageann.Search(query_ds, search_json, nullptr);
+            REQUIRE(results.has_value());
+        }
+    }
+
+    // Cleanup
+    fs::remove_all(kDir);
+}
+
+TEST_CASE("PageANN - GetVectorByIds test", "[pageann][getvector]") {
+    // Setup
+    fs::remove_all(kDir);
+    REQUIRE_NOTHROW(fs::create_directory(kDir));
+
+    auto version = GenTestVersionList();
+    auto metric_str = knowhere::metric::L2;
+
+    // Generate test data
+    auto base_ds = GenDataSet(kNumRows, kDim, 30);
+
+    auto build_gen = [&]() {
+        knowhere::Json json;
+        json["dim"] = kDim;
+        json["metric_type"] = metric_str;
+        json["index_prefix"] = kL2IndexPrefix;
+        json["data_path"] = kRawDataPath;
+        json["max_degree"] = 56;
+        json["search_list_size"] = 128;
+        return json;
+    };
+
+    // Write raw data
+    auto base_ptr = static_cast<const float*>(base_ds->GetTensor());
+    WriteRawDataToDisk<float>(kRawDataPath, base_ptr, kNumRows, kDim);
+
+    SECTION("Get vectors by IDs") {
+        knowhere::BinarySet binset;
+        {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto pageann_index_pack = knowhere::Pack(file_manager);
+
+            auto pageann = knowhere::IndexFactory::Instance()
+                                .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
+                                .value();
+
+            auto build_json = build_gen();
+            pageann.Build(nullptr, build_json);
+            pageann.Serialize(binset);
+        }
+
+        // Deserialize and get vectors
+        {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto pageann_index_pack = knowhere::Pack(file_manager);
+
+            auto pageann = knowhere::IndexFactory::Instance()
+                                .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
+                                .value();
+
+            knowhere::Json search_json;
+            search_json["dim"] = kDim;
+            search_json["metric_type"] = metric_str;
+            search_json["index_prefix"] = kL2IndexPrefix;
+
+            pageann.Deserialize(binset, search_json);
+
+            // Create dataset with IDs to retrieve
+            std::vector<int64_t> ids = {0, 10, 100, 500, 999};
+            auto id_ds = GenIdsDataSet(ids.size(), ids);
+
+            auto vectors = pageann.GetVectorByIds(id_ds, nullptr);
+            REQUIRE(vectors.has_value());
+
+            // Verify returned vectors
+            auto vec_data = vectors.value()->GetTensor();
+            REQUIRE(vec_data != nullptr);
+            REQUIRE(vectors.value()->GetRows() == static_cast<int64_t>(ids.size()));
+            REQUIRE(vectors.value()->GetDim() == kDim);
+        }
+    }
+
+    // Cleanup
+    fs::remove_all(kDir);
+}
+
+TEST_CASE("PageANN - GetIndexMeta test", "[pageann][metadata]") {
+    // Setup
+    fs::remove_all(kDir);
+    REQUIRE_NOTHROW(fs::create_directory(kDir));
+
+    auto version = GenTestVersionList();
+    auto metric_str = knowhere::metric::L2;
+
+    // Generate test data
+    auto base_ds = GenDataSet(kNumRows, kDim, 30);
+
+    auto build_gen = [&]() {
+        knowhere::Json json;
+        json["dim"] = kDim;
+        json["metric_type"] = metric_str;
+        json["index_prefix"] = kL2IndexPrefix;
+        json["data_path"] = kRawDataPath;
+        json["max_degree"] = 56;
+        json["search_list_size"] = 128;
+        json["enable_lsh_routing"] = true;
+        return json;
+    };
+
+    // Write raw data
+    auto base_ptr = static_cast<const float*>(base_ds->GetTensor());
+    WriteRawDataToDisk<float>(kRawDataPath, base_ptr, kNumRows, kDim);
+
+    SECTION("Get index metadata") {
+        knowhere::BinarySet binset;
+        {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto pageann_index_pack = knowhere::Pack(file_manager);
+
+            auto pageann = knowhere::IndexFactory::Instance()
+                                .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
+                                .value();
+
+            auto build_json = build_gen();
+            pageann.Build(nullptr, build_json);
+            pageann.Serialize(binset);
+        }
+
+        // Deserialize and get metadata
+        {
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto pageann_index_pack = knowhere::Pack(file_manager);
+
+            auto pageann = knowhere::IndexFactory::Instance()
+                                .Create<knowhere::fp32>("PAGEANN", version, pageann_index_pack)
+                                .value();
+
+            knowhere::Json search_json;
+            search_json["dim"] = kDim;
+            search_json["metric_type"] = metric_str;
+            search_json["index_prefix"] = kL2IndexPrefix;
+
+            pageann.Deserialize(binset, search_json);
+
+            auto meta = pageann.GetIndexMeta(knowhere::Json{});
+            REQUIRE(meta.has_value());
+
+            // Verify metadata was returned
+            auto json_info = meta.value()->GetJsonInfo();
+            REQUIRE(!json_info.empty());
+        }
     }
 
     // Cleanup

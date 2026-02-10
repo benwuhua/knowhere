@@ -1039,8 +1039,8 @@ class PageANNIndexNode : public DiskANNIndexNode<DataType> {
         auto pageann_conf = static_cast<const PageANNConfig&>(*cfg);
 
         LOG_KNOWHERE_INFO_ << "PageANN Deserialize called with optimizations: "
-                           << "prefetch=" << pageann_conf.enable_frequency_aware_cache.value()
-                           << ", freq_cache=" << pageann_conf.enable_frequency_aware_cache.value();
+                           << "prefetch_batch_size=" << pageann_conf.prefetch_batch_size.value_or(16)
+                           << ", freq_cache=" << pageann_conf.enable_frequency_aware_cache.value_or(true);
 
         // Call parent DiskANNIndexNode::Deserialize()
         Status parent_status = DiskANNIndexNode<DataType>::Deserialize(binset, cfg);
@@ -1091,8 +1091,8 @@ class PageANNIndexNode : public DiskANNIndexNode<DataType> {
 
         auto pageann_conf = static_cast<const PageANNConfig&>(*cfg);
 
-        enable_prefetch_ = pageann_conf.enable_frequency_aware_cache.has_value()
-                           ? pageann_conf.enable_frequency_aware_cache.value()
+        enable_prefetch_ = pageann_conf.prefetch_batch_size.has_value()
+                           ? pageann_conf.prefetch_batch_size.value() > 0
                            : true;
         enable_freq_aware_cache_ = pageann_conf.enable_frequency_aware_cache.has_value()
                                    ? pageann_conf.enable_frequency_aware_cache.value()
