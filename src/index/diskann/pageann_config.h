@@ -51,10 +51,8 @@ class PageANNConfig : public DiskANNConfig {
     CFG_FLOAT cache_decay_factor;
 
     KNOHWERE_DECLARE_CONFIG(PageANNConfig) {
-        // Inherit all DiskANNConfig fields
-        DiskANNConfig::static_get();
-
         // PageANN-specific fields
+        // Note: All DiskANNConfig fields are inherited automatically
 
         KNOWHERE_CONFIG_DECLARE_FIELD(prefetch_batch_size)
             .description("number of nodes to prefetch per beam iteration")
