@@ -107,7 +107,7 @@ class KnowhereConan(ConanFile):
         self.requires("nlohmann_json/3.11.2@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("openssl/1.1.1q@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("prometheus-cpp/1.1.0@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
-        self.requires("zlib/1.2.12@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
+        self.requires("zlib/1.2.13@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("double-conversion/3.2.1@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("xz_utils/[>=5.2.5]@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         self.requires("protobuf/3.21.4@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
