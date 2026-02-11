@@ -114,8 +114,8 @@ class KnowhereConan(ConanFile):
         self.requires("fmt/9.1.0@cbu3rd/stable", transitive_headers=True, transitive_libs=True, force=True)
         self.requires("folly/2023.10.30.08@cbu3rd.milvus/stable", transitive_headers=True, transitive_libs=True)
         self.requires("libcurl/8.2.1@cbu3rd/stable", transitive_headers=True, transitive_libs=True, force=True)
-        self.requires("simde/[>=0.8.2]@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
-        self.requires("xxhash/0.8.3@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
+        self.requires("simde/[>=0.8.2]", transitive_headers=True, transitive_libs=True)
+        self.requires("xxhash/0.8.2@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         if self.settings.os == "Android":
             self.requires("openblas/0.3.27@cbu3rd/stable", transitive_headers=True, transitive_libs=True)
         if not self.options.with_light:
