@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -30,6 +31,7 @@
 #include "common/filter_distance.h"
 #include "knowhere/comp/index_param.h"
 #include "knowhere/comp/knowhere_config.h"
+#include "knowhere/dataset.h"
 #include "knowhere/index/index_factory.h"
 #include "utils.h"
 
