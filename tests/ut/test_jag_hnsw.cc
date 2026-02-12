@@ -61,7 +61,7 @@ struct JAGBenchmarkConfig {
     int k = 10;                 // Top-k
     int num_labels = 10;        // Number of label categories
     int hnsw_m = 32;            // HNSW M parameter
-    int hnsw_ef_c = 200;        // HNSW ef_construction
+    int hnsw_ef_construction = 200;  // HNSW efConstruction
     int hnsw_ef = 256;          // HNSW ef for search
     int seed = 42;
 };
@@ -305,8 +305,8 @@ RunJAGBenchmark(const JAGBenchmarkConfig& cfg) {
     knowhere::Json build_conf;
     build_conf[knowhere::meta::DIM] = cfg.dim;
     build_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
-    build_conf[knowhere::indexparam::HNSW_BUILD_M] = cfg.hnsw_m;
-    build_conf[knowhere::indexparam::HNSW_BUILD_EF_C] = cfg.hnsw_ef_c;
+    build_conf[knowhere::indexparam::HNSW_M] = cfg.hnsw_m;
+    build_conf[knowhere::indexparam::EFCONSTRUCTION] = cfg.hnsw_ef_construction;
 
     auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
     auto index_res = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
@@ -322,7 +322,7 @@ RunJAGBenchmark(const JAGBenchmarkConfig& cfg) {
     search_conf[knowhere::meta::DIM] = cfg.dim;
     search_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
     search_conf[knowhere::meta::TOPK] = cfg.k;
-    search_conf[knowhere::indexparam::HNSW_SEARCH_EF] = cfg.hnsw_ef;
+    search_conf[knowhere::indexparam::EF] = cfg.hnsw_ef;
 
     // Create bitset for filtering (bit=1 means filtered out)
     std::vector<uint8_t> bitset_data((cfg.n + 7) / 8, 0xFF);
