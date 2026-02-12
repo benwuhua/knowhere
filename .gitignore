@@ -72,3 +72,6 @@ CMakeUserPresets.json
 *.egg-info
 
 CLAUDE.md
+
+# Git worktrees
+.worktrees/
