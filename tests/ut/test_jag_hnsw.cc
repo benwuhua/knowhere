@@ -15,10 +15,14 @@
 #include "catch2/catch_test_macros.hpp"
 #include "common/filter_distance.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <queue>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace {
 
