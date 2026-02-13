@@ -27,6 +27,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <faiss/IndexHNSW.h>
+
 #include "catch2/catch_test_macros.hpp"
 #include "common/filter_distance.h"
 #include "knowhere/comp/index_param.h"
@@ -278,6 +280,156 @@ ComputeFilteredGroundTruth(const float* base_data, const float* query, int64_t n
     for (int i = 0; i < std::min(k, (int)distances.size()); i++) {
         result.push_back(distances[i].second);
     }
+    return result;
+}
+
+// ============== Real HNSW Graph Wrapper ==============
+
+// Wrapper to access real HNSW graph from faiss::IndexHNSWFlat
+class RealHNSWGraph {
+ public:
+    faiss::IndexHNSWFlat* index;
+    const float* base_data;
+    int64_t dim;
+
+    RealHNSWGraph(faiss::IndexHNSWFlat* idx, const float* data, int64_t d)
+        : index(idx), base_data(data), dim(d) {}
+
+    int64_t
+    size() const {
+        return index->ntotal;
+    }
+
+    int64_t
+    GetEntryPoint() const {
+        return index->hnsw.entry_point;
+    }
+
+    std::vector<int64_t>
+    GetNeighbors(int64_t node_id) const {
+        std::vector<int64_t> neighbors;
+        const auto& hnsw = index->hnsw;
+        size_t begin, end;
+        // Get neighbors from layer 0 (the base layer with all connections)
+        hnsw.neighbor_range(node_id, 0, &begin, &end);
+        for (size_t i = begin; i < end; i++) {
+            int32_t neighbor = hnsw.neighbors[i];
+            if (neighbor != -1 && neighbor != node_id) {
+                neighbors.push_back(neighbor);
+            }
+        }
+        return neighbors;
+    }
+
+    float
+    ComputeDistance(const float* query, int64_t node_id) const {
+        const float* vec = base_data + node_id * dim;
+        return L2DistanceSq(query, vec, dim);
+    }
+};
+
+// Baseline search on real HNSW graph (post-filter)
+SearchResult
+SearchBaselineReal(const RealHNSWGraph& graph, const float* query, int k,
+                   const knowhere::LabelFilterSet& filter_set, int32_t target_label,
+                   int64_t max_visits = 10000) {
+    SearchResult result;
+    std::unordered_set<int64_t> visited;
+    std::priority_queue<std::pair<float, int64_t>> frontier;
+    std::vector<std::pair<float, int64_t>> candidates;
+
+    // Start from entry point
+    int64_t entry = graph.GetEntryPoint();
+    if (entry < 0 || entry >= graph.size()) {
+        entry = 0;  // Fallback to node 0 if entry point is invalid
+    }
+    float entry_dist = graph.ComputeDistance(query, entry);
+    frontier.push({-entry_dist, entry});
+
+    while (!frontier.empty() && result.nodes_visited < max_visits) {
+        auto [neg_dist, current] = frontier.top();
+        frontier.pop();
+
+        if (visited.count(current)) continue;
+        visited.insert(current);
+        result.nodes_visited++;
+
+        if (filter_set.GetLabel(current) == target_label) {
+            candidates.push_back({-neg_dist, current});
+            result.valid_visits++;
+        }
+
+        // Explore neighbors from real HNSW graph
+        auto neighbors = graph.GetNeighbors(current);
+        for (int64_t neighbor : neighbors) {
+            if (!visited.count(neighbor) && neighbor >= 0 && neighbor < graph.size()) {
+                float dist = graph.ComputeDistance(query, neighbor);
+                frontier.push({-dist, neighbor});
+            }
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+    for (int i = 0; i < std::min(k, (int)candidates.size()); i++) {
+        result.ids.push_back(candidates[i].second);
+    }
+
+    return result;
+}
+
+// JAG search on real HNSW graph (filter-guided)
+SearchResult
+SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
+              const knowhere::LabelFilterSet& filter_set, int32_t target_label,
+              float filter_weight, int64_t max_visits = 10000) {
+    SearchResult result;
+    std::unordered_set<int64_t> visited;
+    std::priority_queue<std::pair<float, int64_t>> frontier;
+    std::vector<std::pair<float, int64_t>> matched;
+
+    // Combined distance function: vector distance + filter penalty
+    auto combined_dist = [&](float vec_dist, int64_t node_id) {
+        int filter_dist = (filter_set.GetLabel(node_id) == target_label) ? 0 : 1;
+        return vec_dist + filter_weight * filter_dist;
+    };
+
+    // Start from entry point
+    int64_t entry = graph.GetEntryPoint();
+    if (entry < 0 || entry >= graph.size()) {
+        entry = 0;
+    }
+    float entry_vec_dist = graph.ComputeDistance(query, entry);
+    frontier.push({-combined_dist(entry_vec_dist, entry), entry});
+
+    while (!frontier.empty() && result.nodes_visited < max_visits && (int)matched.size() < k * 10) {
+        auto [neg_combined, current] = frontier.top();
+        frontier.pop();
+
+        if (visited.count(current)) continue;
+        visited.insert(current);
+        result.nodes_visited++;
+
+        if (filter_set.GetLabel(current) == target_label) {
+            float vec_dist = graph.ComputeDistance(query, current);
+            matched.push_back({vec_dist, current});
+            result.valid_visits++;
+        }
+
+        // Explore neighbors from real HNSW graph
+        auto neighbors = graph.GetNeighbors(current);
+        for (int64_t neighbor : neighbors) {
+            if (!visited.count(neighbor) && neighbor >= 0 && neighbor < graph.size()) {
+                float vec_dist = graph.ComputeDistance(query, neighbor);
+                frontier.push({-combined_dist(vec_dist, neighbor), neighbor});
+            }
+        }
+    }
+
+    std::sort(matched.begin(), matched.end());
+    for (int i = 0; i < std::min(k, (int)matched.size()); i++) {
+        result.ids.push_back(matched[i].second);
+    }
+
     return result;
 }
 
@@ -657,48 +809,15 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
     SIFT1MResult result;
     result.filter_ratio = filter_set.GetFilterRatio(target_label);
 
-    // Build HNSW index
-    knowhere::Json build_conf;
-    build_conf[knowhere::meta::DIM] = dim;
-    build_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
-    build_conf[knowhere::indexparam::HNSW_M] = cfg.hnsw_m;
-    build_conf[knowhere::indexparam::EFCONSTRUCTION] = cfg.hnsw_ef_construction;
+    // Build real faiss HNSW index (not Knowhere wrapper)
+    // This gives us direct access to the HNSW graph structure
+    faiss::IndexHNSWFlat hnsw_index(dim, cfg.hnsw_m, faiss::METRIC_L2);
+    hnsw_index.hnsw.efSearch = cfg.hnsw_ef;
+    hnsw_index.hnsw.efConstruction = cfg.hnsw_ef_construction;
+    hnsw_index.add(n, base_data);
 
-    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
-    auto index_res = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
-        knowhere::IndexEnum::INDEX_HNSW, version, nullptr);
-    if (!index_res.has_value()) {
-        return result;
-    }
-    auto index = index_res.value();
-
-    // Create dataset for building
-    auto base_ds = knowhere::GenDataSet(n, dim, base_data);
-    auto build_res = index.Build(base_ds, build_conf);
-    if (build_res != knowhere::Status::success) {
-        return result;
-    }
-
-    // Prepare search config
-    knowhere::Json search_conf;
-    search_conf[knowhere::meta::DIM] = dim;
-    search_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
-    search_conf[knowhere::meta::TOPK] = cfg.k;
-    search_conf[knowhere::indexparam::EF] = cfg.hnsw_ef;
-
-    // Create bitset for filtering
-    std::vector<uint8_t> bitset_data((n + 7) / 8, 0xFF);
-    for (int64_t i = 0; i < n; i++) {
-        if (filter_set.GetLabel(i) == target_label) {
-            bitset_data[i / 8] &= ~(1 << (i % 8));
-        }
-    }
-    knowhere::BitsetView bitset(bitset_data.data(), n);
-
-    // Build simple graph for JAG simulation
-    SimpleTestGraph sim_graph;
-    sim_graph.dim = dim;
-    sim_graph.BuildRandomGraph(std::min(n, (int64_t)10000), cfg.hnsw_m, 42);
+    // Create graph wrapper for JAG search
+    RealHNSWGraph real_graph(&hnsw_index, base_data, dim);
 
     // Aggregate metrics
     int total_baseline_hits = 0;
@@ -719,33 +838,26 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
         std::set<int64_t> gt_set(gt.begin(), gt.end());
         total_gt_count += gt.size();
 
-        // Run Knowhere HNSW search (baseline)
-        auto query_ds_single = knowhere::GenDataSet(1, dim, query);
-        auto search_res = index.Search(query_ds_single, search_conf, bitset);
-        if (search_res.has_value()) {
-            auto res_ids = search_res.value()->GetIds();
-            for (int i = 0; i < cfg.k; i++) {
-                if (gt_set.count(res_ids[i])) {
-                    total_baseline_hits++;
-                }
+        // Run baseline search on real HNSW graph (post-filter)
+        auto real_baseline = SearchBaselineReal(real_graph, query, cfg.k, filter_set, target_label);
+        for (auto id : real_baseline.ids) {
+            if (gt_set.count(id)) {
+                total_baseline_hits++;
             }
         }
 
-        // Run JAG simulation on simple graph
-        auto sim_baseline = SearchBaseline(sim_graph, base_data, query, cfg.k, filter_set, target_label);
-        auto sim_jag = SearchJAG(sim_graph, base_data, query, cfg.k, filter_set, target_label, cfg.filter_weight);
-
-        total_baseline_visits += sim_baseline.nodes_visited;
-        total_jag_visits += sim_jag.nodes_visited;
-        total_baseline_valid += sim_baseline.valid_visits;
-        total_jag_valid += sim_jag.valid_visits;
-
-        // Check JAG recall
-        for (auto id : sim_jag.ids) {
+        // Run JAG search on real HNSW graph (filter-guided)
+        auto real_jag = SearchJAGReal(real_graph, query, cfg.k, filter_set, target_label, cfg.filter_weight);
+        for (auto id : real_jag.ids) {
             if (gt_set.count(id)) {
                 total_jag_hits++;
             }
         }
+
+        total_baseline_visits += real_baseline.nodes_visited;
+        total_jag_visits += real_jag.nodes_visited;
+        total_baseline_valid += real_baseline.valid_visits;
+        total_jag_valid += real_jag.valid_visits;
     }
 
     // Compute aggregated metrics
