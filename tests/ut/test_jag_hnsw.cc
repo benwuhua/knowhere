@@ -314,7 +314,7 @@ RunJAGBenchmark(const JAGBenchmarkConfig& cfg) {
     REQUIRE(index_res.has_value());
     auto index = index_res.value();
 
-    auto build_res = index.Build(*base_ds, build_conf);
+    auto build_res = index.Build(base_ds, build_conf);
     REQUIRE(build_res == knowhere::Status::success);
 
     // Prepare search config
@@ -351,7 +351,7 @@ RunJAGBenchmark(const JAGBenchmarkConfig& cfg) {
         auto query_ds_single = knowhere::GenDataSet(1, cfg.dim, query_ptr);
         query_ds_single->SetIsOwner(true);
 
-        auto search_res = index.Search(*query_ds_single, search_conf, bitset);
+        auto search_res = index.Search(query_ds_single, search_conf, bitset);
         REQUIRE(search_res.has_value());
 
         auto res_ids = search_res.value()->GetIds();
@@ -595,4 +595,282 @@ TEST_CASE("JAG-HNSW Comparison with JAG Paper Metrics", "[jag][benchmark][compar
     std::cout << "for high filter ratios (>50%), with ~50-100% improvement in" << std::endl;
     std::cout << "valid visit ratio.\n" << std::endl;
     std::cout << "========================================" << std::endl;
+}
+
+// ============== SIFT1M Benchmark Test ==============
+
+// Load .ibin file (integer binary format)
+bool
+LoadIBin(const std::string& filename, std::vector<int32_t>& data, int32_t& n) {
+    std::ifstream ifs(filename, std::ios::binary);
+    if (!ifs.is_open()) {
+        return false;
+    }
+    ifs.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
+    data.resize(static_cast<size_t>(n));
+    ifs.read(reinterpret_cast<char*>(data.data()), n * sizeof(int32_t));
+    return ifs.good() || ifs.eof();
+}
+
+// SIFT1M benchmark configuration
+struct SIFT1MConfig {
+    std::string data_path = "./data";
+    int k = 10;
+    int hnsw_m = 32;
+    int hnsw_ef_construction = 200;
+    int hnsw_ef = 256;
+    float filter_weight = 2.0f;
+    int num_queries = 100;  // Number of queries to run
+};
+
+// SIFT1M benchmark result
+struct SIFT1MResult {
+    float filter_ratio;
+    float baseline_recall;
+    float jag_recall;
+    int64_t baseline_nodes_visited;
+    int64_t jag_nodes_visited;
+    float baseline_valid_ratio;
+    float jag_valid_ratio;
+
+    float
+    VisitReduction() const {
+        return (baseline_nodes_visited > 0)
+            ? 1.0f - static_cast<float>(jag_nodes_visited) / baseline_nodes_visited
+            : 0.0f;
+    }
+
+    float
+    ValidRatioImprovement() const {
+        return (baseline_valid_ratio > 0)
+            ? jag_valid_ratio / baseline_valid_ratio - 1.0f
+            : 0.0f;
+    }
+};
+
+// Run SIFT1M benchmark for a specific filter ratio (target label)
+SIFT1MResult
+RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
+                   const float* query_data, int64_t nq,
+                   const knowhere::LabelFilterSet& filter_set, int32_t target_label,
+                   const SIFT1MConfig& cfg) {
+    SIFT1MResult result;
+    result.filter_ratio = filter_set.GetFilterRatio(target_label);
+
+    // Build HNSW index
+    knowhere::Json build_conf;
+    build_conf[knowhere::meta::DIM] = dim;
+    build_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    build_conf[knowhere::indexparam::HNSW_M] = cfg.hnsw_m;
+    build_conf[knowhere::indexparam::EFCONSTRUCTION] = cfg.hnsw_ef_construction;
+
+    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+    auto index_res = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
+        knowhere::IndexEnum::INDEX_HNSW, version, nullptr);
+    if (!index_res.has_value()) {
+        return result;
+    }
+    auto index = index_res.value();
+
+    // Create dataset for building
+    auto base_ds = knowhere::GenDataSet(n, dim, base_data);
+    auto build_res = index.Build(base_ds, build_conf);
+    if (build_res != knowhere::Status::success) {
+        return result;
+    }
+
+    // Prepare search config
+    knowhere::Json search_conf;
+    search_conf[knowhere::meta::DIM] = dim;
+    search_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    search_conf[knowhere::meta::TOPK] = cfg.k;
+    search_conf[knowhere::indexparam::EF] = cfg.hnsw_ef;
+
+    // Create bitset for filtering
+    std::vector<uint8_t> bitset_data((n + 7) / 8, 0xFF);
+    for (int64_t i = 0; i < n; i++) {
+        if (filter_set.GetLabel(i) == target_label) {
+            bitset_data[i / 8] &= ~(1 << (i % 8));
+        }
+    }
+    knowhere::BitsetView bitset(bitset_data.data(), n);
+
+    // Build simple graph for JAG simulation
+    SimpleTestGraph sim_graph;
+    sim_graph.dim = dim;
+    sim_graph.BuildRandomGraph(std::min(n, (int64_t)10000), cfg.hnsw_m, 42);
+
+    // Aggregate metrics
+    int total_baseline_hits = 0;
+    int total_jag_hits = 0;
+    int total_gt_count = 0;
+    int64_t total_baseline_visits = 0;
+    int64_t total_jag_visits = 0;
+    int64_t total_baseline_valid = 0;
+    int64_t total_jag_valid = 0;
+
+    int queries_to_run = std::min(static_cast<int64_t>(cfg.num_queries), nq);
+
+    for (int q = 0; q < queries_to_run; q++) {
+        const float* query = query_data + q * dim;
+
+        // Compute ground truth for this query
+        auto gt = ComputeFilteredGroundTruth(base_data, query, n, dim, cfg.k, filter_set, target_label);
+        std::set<int64_t> gt_set(gt.begin(), gt.end());
+        total_gt_count += gt.size();
+
+        // Run Knowhere HNSW search (baseline)
+        auto query_ds_single = knowhere::GenDataSet(1, dim, query);
+        auto search_res = index.Search(query_ds_single, search_conf, bitset);
+        if (search_res.has_value()) {
+            auto res_ids = search_res.value()->GetIds();
+            for (int i = 0; i < cfg.k; i++) {
+                if (gt_set.count(res_ids[i])) {
+                    total_baseline_hits++;
+                }
+            }
+        }
+
+        // Run JAG simulation on simple graph
+        auto sim_baseline = SearchBaseline(sim_graph, base_data, query, cfg.k, filter_set, target_label);
+        auto sim_jag = SearchJAG(sim_graph, base_data, query, cfg.k, filter_set, target_label, cfg.filter_weight);
+
+        total_baseline_visits += sim_baseline.nodes_visited;
+        total_jag_visits += sim_jag.nodes_visited;
+        total_baseline_valid += sim_baseline.valid_visits;
+        total_jag_valid += sim_jag.valid_visits;
+
+        // Check JAG recall
+        for (auto id : sim_jag.ids) {
+            if (gt_set.count(id)) {
+                total_jag_hits++;
+            }
+        }
+    }
+
+    // Compute aggregated metrics
+    result.baseline_recall = (total_gt_count > 0)
+        ? static_cast<float>(total_baseline_hits) / total_gt_count : 0.0f;
+    result.jag_recall = (total_gt_count > 0)
+        ? static_cast<float>(total_jag_hits) / total_gt_count : 0.0f;
+    result.baseline_nodes_visited = total_baseline_visits / queries_to_run;
+    result.jag_nodes_visited = total_jag_visits / queries_to_run;
+    result.baseline_valid_ratio = (total_baseline_visits > 0)
+        ? static_cast<float>(total_baseline_valid) / total_baseline_visits : 0.0f;
+    result.jag_valid_ratio = (total_jag_visits > 0)
+        ? static_cast<float>(total_jag_valid) / total_jag_visits : 0.0f;
+
+    return result;
+}
+
+TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
+    // Get data path from environment or use default
+    const char* env_path = std::getenv("SIFT1M_PATH");
+    SIFT1MConfig cfg;
+    if (env_path) {
+        cfg.data_path = env_path;
+    }
+
+    std::string base_path = cfg.data_path + "/sift1m-base.fbin";
+    std::string query_path = cfg.data_path + "/sift1m-query.fbin";
+    std::string label_path = cfg.data_path + "/sift1m-base-filters-label.ibin";
+
+    // Check if data files exist
+    std::ifstream base_test(base_path), query_test(query_path), label_test(label_path);
+    if (!base_test.good() || !query_test.good() || !label_test.good()) {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "SIFT1M Benchmark: SKIPPED" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "Data files not found. To run this benchmark:" << std::endl;
+        std::cout << "  1. cd tests/ut && ./prepare_sift1m_data.sh ./data" << std::endl;
+        std::cout << "  2. export SIFT1M_PATH=./data" << std::endl;
+        std::cout << "  3. Run this test again" << std::endl;
+        std::cout << "========================================" << std::endl;
+        return;
+    }
+
+    // Load data
+    std::vector<float> base_data, query_data;
+    int32_t n, dim, nq, query_dim;
+
+    REQUIRE(LoadFBin(base_path, base_data, n, dim));
+    REQUIRE(LoadFBin(query_path, query_data, nq, query_dim));
+    REQUIRE(dim == query_dim);
+
+    // Load labels
+    std::vector<int32_t> labels;
+    int32_t num_labels;
+    REQUIRE(LoadIBin(label_path, labels, num_labels));
+    REQUIRE(num_labels == n);
+
+    // Build LabelFilterSet
+    knowhere::LabelFilterSet filter_set;
+    filter_set.labels = std::move(labels);
+    for (int32_t i = 0; i < n; i++) {
+        filter_set.label_to_ids[filter_set.labels[i]].push_back(i);
+    }
+
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "JAG-HNSW SIFT1M Benchmark" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "Dataset: " << n << " vectors, " << dim << "D" << std::endl;
+    std::cout << "Queries: " << nq << " (using " << cfg.num_queries << ")" << std::endl;
+    std::cout << "K: " << cfg.k << std::endl;
+    std::cout << "HNSW: M=" << cfg.hnsw_m << ", ef=" << cfg.hnsw_ef << std::endl;
+    std::cout << "JAG Filter Weight: " << cfg.filter_weight << std::endl;
+    std::cout << "========================================\n" << std::endl;
+
+    // Test multiple filter ratios
+    std::vector<SIFT1MResult> results;
+
+    // Use labels with different ratios (sorted by frequency)
+    std::vector<std::pair<int32_t, size_t>> label_counts;
+    for (const auto& [label, ids] : filter_set.label_to_ids) {
+        label_counts.push_back({label, ids.size()});
+    }
+    std::sort(label_counts.begin(), label_counts.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    // Print header
+    std::cout << std::left
+              << std::setw(10) << "Filter%" << " | "
+              << std::setw(12) << "Base_Recall" << " | "
+              << std::setw(12) << "JAG_Recall" << " | "
+              << std::setw(14) << "Visit_Reduce%" << " | "
+              << std::setw(14) << "Valid_Improve%" << " | "
+              << std::setw(12) << "JAG_Paper" << std::endl;
+    std::cout << std::string(85, '-') << std::endl;
+
+    // Test top labels to get different filter ratios
+    int labels_to_test = std::min(5, static_cast<int>(label_counts.size()));
+    for (int i = 0; i < labels_to_test; i++) {
+        int32_t target_label = label_counts[i].first;
+
+        auto result = RunSIFT1MBenchmark(base_data.data(), n, dim,
+                                         query_data.data(), nq,
+                                         filter_set, target_label, cfg);
+        results.push_back(result);
+
+        // JAG paper expected improvement
+        std::string expected = (result.filter_ratio >= 0.3f) ? "20-40%" : "10-30%";
+
+        std::cout << std::setw(10) << std::setprecision(1) << (result.filter_ratio * 100) << " | "
+                  << std::setw(12) << std::setprecision(4) << result.baseline_recall << " | "
+                  << std::setw(12) << result.jag_recall << " | "
+                  << std::setw(14) << std::setprecision(1) << (result.VisitReduction() * 100) << " | "
+                  << std::setw(14) << (result.ValidRatioImprovement() * 100) << " | "
+                  << std::setw(12) << expected << std::endl;
+    }
+
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "Summary: JAG paper reports ~20-40% reduction in visited nodes" << std::endl;
+    std::cout << "for high filter ratios (>30%), with ~50-100% improvement in" << std::endl;
+    std::cout << "valid visit ratio while maintaining similar recall." << std::endl;
+    std::cout << "========================================" << std::endl;
+
+    // Basic sanity checks
+    for (const auto& r : results) {
+        REQUIRE(r.baseline_recall >= 0.0f);
+        REQUIRE(r.baseline_recall <= 1.0f);
+    }
 }
