@@ -844,20 +844,19 @@ ComputeStdDev(const std::vector<double>& values) {
 }
 
 // Compute optimal filter_weight based on dataset statistics
-// The key insight: filter_weight should be large enough to strongly prefer
-// matching nodes, but not so large that it prevents exploration entirely.
-// A good heuristic: use 2-5x the max observed vector distance
+// The key insight: filter_weight should give preference to matching nodes
+// but still allow exploration through non-matching nodes to reach matching ones.
+// Using 0.5-1.0x avg distance works better than large multipliers.
 float
 ComputeOptimalFilterWeight(const float* base_data, int64_t n, int64_t dim,
                            int samples = 1000) {
     std::mt19937 rng(42);
     std::uniform_int_distribution<int64_t> dist(0, n - 1);
 
-    double max_vec_dist = 0.0;
     double sum_vec_dist = 0.0;
     int count = 0;
 
-    // Sample random pairs to estimate max vector distance
+    // Sample random pairs to estimate average vector distance
     for (int i = 0; i < samples; i++) {
         int64_t p = dist(rng);
         int64_t q = dist(rng);
@@ -867,16 +866,15 @@ ComputeOptimalFilterWeight(const float* base_data, int64_t n, int64_t dim,
         const float* q_vec = base_data + q * dim;
         double d = L2DistanceSq(p_vec, q_vec, dim);
 
-        max_vec_dist = std::max(max_vec_dist, d);
         sum_vec_dist += d;
         count++;
     }
 
-    // Use 3x the max observed distance as filter_weight
-    // This makes non-matching nodes rank worse than the farthest matching nodes
-    // but still allows some exploration through them
     double avg_dist = (count > 0) ? sum_vec_dist / count : 10000.0;
-    return static_cast<float>(std::max(max_vec_dist * 3.0, avg_dist * 10.0));
+
+    // Use 1x average distance as filter_weight
+    // This gives preference to matching nodes but allows exploration
+    return static_cast<float>(avg_dist);
 }
 
 // SIFT1M benchmark configuration
@@ -948,6 +946,7 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
     if (filter_weight == 0.0f) {
         filter_weight = ComputeOptimalFilterWeight(base_data, n, dim);
     }
+    std::cout << "Computed filter_weight: " << filter_weight << std::endl;
 
     // Aggregate metrics
     int total_baseline_hits = 0;
