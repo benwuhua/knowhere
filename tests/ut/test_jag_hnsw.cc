@@ -424,10 +424,50 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
         return vec_dist + filter_weight * filter_dist;
     };
 
-    // Start from entry point
+    // Find a good entry point that matches the filter
+    // First do normal greedy search to upper layers
     int64_t entry = graph.GreedySearchToUpperLayers(query);
     if (entry < 0 || entry >= graph.size()) {
         entry = 0;
+    }
+
+    // If entry doesn't match, do BFS to find nearest matching node
+    if (filter_set.GetLabel(entry) != target_label) {
+        std::queue<int64_t> bfs_queue;
+        std::unordered_set<int64_t> bfs_visited;
+        bfs_queue.push(entry);
+        bfs_visited.insert(entry);
+
+        int bfs_limit = 1000;  // Limit BFS search
+        float best_dist = std::numeric_limits<float>::max();
+        int64_t best_match = -1;
+
+        while (!bfs_queue.empty() && bfs_limit > 0) {
+            int64_t current = bfs_queue.front();
+            bfs_queue.pop();
+            bfs_limit--;
+
+            if (filter_set.GetLabel(current) == target_label) {
+                float dist = graph.ComputeDistance(query, current);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_match = current;
+                }
+            }
+
+            // Explore neighbors
+            auto neighbors = graph.GetNeighbors(current, 0);
+            for (int64_t neighbor : neighbors) {
+                if (neighbor >= 0 && neighbor < graph.size() && !bfs_visited.count(neighbor)) {
+                    bfs_visited.insert(neighbor);
+                    bfs_queue.push(neighbor);
+                }
+            }
+        }
+
+        if (best_match >= 0) {
+            entry = best_match;
+        }
     }
 
     // Initialize
@@ -1025,8 +1065,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v6" << std::endl;
-    std::cout << "filter_weight = 0.3 * avg_dist, oversearch = 50x" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v7" << std::endl;
+    std::cout << "BFS to find matching entry point" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
