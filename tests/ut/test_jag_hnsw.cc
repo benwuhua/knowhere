@@ -844,39 +844,39 @@ ComputeStdDev(const std::vector<double>& values) {
 }
 
 // Compute optimal filter_weight based on dataset statistics
-// Based on original JAG paper: filter_weight = inf * max_normalized_h
-// where normalized_h = std_dev(vector_dist) / std_dev(filter_dist)
+// The key insight: filter_weight should be large enough to strongly prefer
+// matching nodes, but not so large that it prevents exploration entirely.
+// A good heuristic: use 2-5x the max observed vector distance
 float
 ComputeOptimalFilterWeight(const float* base_data, int64_t n, int64_t dim,
-                           const knowhere::LabelFilterSet& filter_set,
-                           int samples = 100) {
+                           int samples = 1000) {
     std::mt19937 rng(42);
     std::uniform_int_distribution<int64_t> dist(0, n - 1);
 
-    double max_normalized_h = 1.0;
+    double max_vec_dist = 0.0;
+    double sum_vec_dist = 0.0;
+    int count = 0;
 
-    // Sample points to compute normalized_h
-    int num_samples = std::min(1000L, n);
-    for (int p = 0; p < num_samples; p++) {
-        std::vector<double> vec_dists, filter_dists;
+    // Sample random pairs to estimate max vector distance
+    for (int i = 0; i < samples; i++) {
+        int64_t p = dist(rng);
+        int64_t q = dist(rng);
+        if (p == q) continue;
 
-        for (int i = 0; i < samples; i++) {
-            int64_t q = dist(rng);
-            const float* p_vec = base_data + p * dim;
-            const float* q_vec = base_data + q * dim;
-            vec_dists.push_back(L2DistanceSq(p_vec, q_vec, dim));
-            filter_dists.push_back(filter_set.GetLabel(p) == filter_set.GetLabel(q) ? 0.0 : 1.0);
-        }
+        const float* p_vec = base_data + p * dim;
+        const float* q_vec = base_data + q * dim;
+        double d = L2DistanceSq(p_vec, q_vec, dim);
 
-        double std_vec = ComputeStdDev(vec_dists);
-        double std_filter = ComputeStdDev(filter_dists);
-        if (std_filter > 1e-6) {
-            max_normalized_h = std::max(max_normalized_h, std_vec / std_filter);
-        }
+        max_vec_dist = std::max(max_vec_dist, d);
+        sum_vec_dist += d;
+        count++;
     }
 
-    // Use a large multiplier like original JAG
-    return static_cast<float>(max_normalized_h * 1e6);
+    // Use 3x the max observed distance as filter_weight
+    // This makes non-matching nodes rank worse than the farthest matching nodes
+    // but still allows some exploration through them
+    double avg_dist = (count > 0) ? sum_vec_dist / count : 10000.0;
+    return static_cast<float>(std::max(max_vec_dist * 3.0, avg_dist * 10.0));
 }
 
 // SIFT1M benchmark configuration
@@ -946,7 +946,7 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
     // Compute optimal filter_weight if not specified
     float filter_weight = cfg.filter_weight;
     if (filter_weight == 0.0f) {
-        filter_weight = ComputeOptimalFilterWeight(base_data, n, dim, filter_set);
+        filter_weight = ComputeOptimalFilterWeight(base_data, n, dim);
     }
 
     // Aggregate metrics
