@@ -891,7 +891,7 @@ ComputeStdDev(const std::vector<double>& values) {
 // Trade-off: recall vs valid_visit_ratio
 float
 ComputeOptimalFilterWeight(const float* base_data, int64_t n, int64_t dim,
-                           float aggressiveness = 0.05f, int samples = 1000) {
+                           float aggressiveness = 0.0f, int samples = 1000) {
     std::mt19937 rng(42);
     std::uniform_int_distribution<int64_t> dist(0, n - 1);
 
@@ -1065,8 +1065,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v8" << std::endl;
-    std::cout << "filter_weight = 0.05 * avg_dist" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v9" << std::endl;
+    std::cout << "filter_weight = 0 (test baseline)" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
