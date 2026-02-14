@@ -388,55 +388,89 @@ class RealHNSWGraph {
 };
 
 // JAG search on real HNSW graph (filter-guided)
+// Based on WeightJAG from the original paper:
+// combined_dist = vec_dist + filter_weight * filter_distance
 SearchResult
 SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
               const knowhere::LabelFilterSet& filter_set, int32_t target_label,
-              float filter_weight, int ef_search = 256) {
+              float filter_weight, int beam_size = 256, int max_visits = 10000) {
     SearchResult result;
-    std::unordered_set<int64_t> visited;
-    // Use a larger buffer for better recall
-    std::priority_queue<std::pair<float, int64_t>> frontier;
-    std::vector<std::pair<float, int64_t>> matched;
+    std::unordered_set<int64_t> seen;  // Track all seen nodes
+    std::vector<std::pair<float, int64_t>> frontier;  // (combined_dist, node_id)
+    std::vector<std::pair<float, int64_t>> visited;   // (combined_dist, node_id)
+    std::vector<std::pair<float, int64_t>> matched;   // (vec_dist, node_id) for results
 
-    // Combined distance function: vector distance + filter penalty
-    // Scale filter_weight relative to expected vector distance range
+    // Combined distance function: vector distance + filter penalty (additive, like original)
+    // filter_distance = 0 if label matches, 1 if not
     auto combined_dist = [&](float vec_dist, int64_t node_id) {
         int filter_dist = (filter_set.GetLabel(node_id) == target_label) ? 0 : 1;
-        return vec_dist * (1.0f + filter_weight * filter_dist);
+        return vec_dist + filter_weight * filter_dist;
     };
 
-    // Phase 1: Multi-layer greedy search to find good entry point for layer 0
+    // Start from entry point (like original JAG which starts from node 0)
     int64_t entry = graph.GreedySearchToUpperLayers(query);
     if (entry < 0 || entry >= graph.size()) {
         entry = 0;
     }
 
-    // Phase 2: Beam search at layer 0 with combined distance
+    // Initialize frontier with entry point
     float entry_vec_dist = graph.ComputeDistance(query, entry);
-    frontier.push({-combined_dist(entry_vec_dist, entry), entry});
+    frontier.push_back({combined_dist(entry_vec_dist, entry), entry});
+    seen.insert(entry);
 
-    // Track visited nodes
-    visited.insert(entry);
+    // Main beam search loop (like original WeightJAG)
+    while (!frontier.empty() && result.nodes_visited < max_visits) {
+        // Find first unvisited node in frontier
+        int id = 0;
+        while (id < frontier.size() && seen.count(frontier[id].second) > 1) {
+            id++;
+        }
+        if (id >= frontier.size() || id >= beam_size) {
+            break;
+        }
 
-    while (!frontier.empty() && (int)matched.size() < ef_search) {
-        auto [neg_combined, current] = frontier.top();
-        frontier.pop();
-
+        // Visit the next node
+        auto [combined, current] = frontier[id];
+        visited.push_back({combined, current});
         result.nodes_visited++;
+        seen.insert(current);
 
+        // Check if this node matches the filter
         if (filter_set.GetLabel(current) == target_label) {
             float vec_dist = graph.ComputeDistance(query, current);
             matched.push_back({vec_dist, current});
             result.valid_visits++;
         }
 
-        // Explore neighbors from real HNSW graph (layer 0)
+        // Explore neighbors
         auto neighbors = graph.GetNeighbors(current, 0);
         for (int64_t neighbor : neighbors) {
-            if (!visited.count(neighbor) && neighbor >= 0 && neighbor < graph.size()) {
-                visited.insert(neighbor);
-                float vec_dist = graph.ComputeDistance(query, neighbor);
-                frontier.push({-combined_dist(vec_dist, neighbor), neighbor});
+            if (seen.count(neighbor) || neighbor < 0 || neighbor >= graph.size()) {
+                continue;
+            }
+
+            // Early termination: skip if filter distance is too large
+            int filter_dist = (filter_set.GetLabel(neighbor) == target_label) ? 0 : 1;
+            if (frontier.size() >= beam_size) {
+                float last_dist = frontier[beam_size - 1].first;
+                if (filter_weight * filter_dist > last_dist) {
+                    seen.insert(neighbor);  // Mark as seen but don't add to frontier
+                    continue;
+                }
+            }
+
+            seen.insert(neighbor);
+            float vec_dist = graph.ComputeDistance(query, neighbor);
+            float combined = combined_dist(vec_dist, neighbor);
+
+            // Insert sorted (like original)
+            auto pos = std::upper_bound(frontier.begin(), frontier.end(),
+                                        std::make_pair(combined, neighbor));
+            frontier.insert(pos, {combined, neighbor});
+
+            // Keep frontier bounded
+            if (frontier.size() > beam_size) {
+                frontier.pop_back();
             }
         }
     }
@@ -788,7 +822,10 @@ struct SIFT1MConfig {
     int hnsw_m = 32;
     int hnsw_ef_construction = 200;
     int hnsw_ef = 256;
-    float filter_weight = 2.0f;
+    // filter_weight should be large enough to strongly penalize non-matching nodes
+    // Original JAG uses very large values (inf * max_normalized_h)
+    // For 128D L2 distance, typical max distance is ~50000, so use 100000
+    float filter_weight = 100000.0f;
     int num_queries = 100;  // Number of queries to run
 };
 
@@ -873,7 +910,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
         }
 
         // Run JAG search on real HNSW graph (filter-guided)
-        auto real_jag = SearchJAGReal(real_graph, query, cfg.k, filter_set, target_label, cfg.filter_weight, cfg.hnsw_ef);
+        auto real_jag = SearchJAGReal(real_graph, query, cfg.k, filter_set, target_label,
+                                      cfg.filter_weight, cfg.hnsw_ef, cfg.hnsw_ef * 10);
         for (auto id : real_jag.ids) {
             if (gt_set.count(id)) {
                 total_jag_hits++;
