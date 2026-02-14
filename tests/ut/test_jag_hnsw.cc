@@ -463,6 +463,14 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
             std::cout << filter_set.GetLabel(entry_neighbors[i]) << " ";
         }
         std::cout << std::endl;
+
+        // Check which neighbors match
+        int matching_neighbors = 0;
+        for (auto n : entry_neighbors) {
+            if (filter_set.GetLabel(n) == target_label) matching_neighbors++;
+        }
+        std::cout << "DEBUG: matching neighbors in entry's neighborhood: " << matching_neighbors << std::endl;
+
         debug_printed = true;
     }
 
@@ -505,7 +513,8 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
     if (matched.empty()) {
         static int empty_count = 0;
         if (empty_count < 3) {
-            std::cout << "DEBUG: No matches found! visited=" << result.nodes_visited << std::endl;
+            std::cout << "DEBUG: No matches found! visited=" << result.nodes_visited
+                      << ", frontier_remaining=" << frontier.size() << std::endl;
             empty_count++;
         }
     }
@@ -1044,8 +1053,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v13" << std::endl;
-    std::cout << "debug mode: print neighbor labels" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v14" << std::endl;
+    std::cout << "debug mode: matching neighbors count" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
