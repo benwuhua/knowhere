@@ -485,6 +485,15 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
         visited.insert(current);
         result.nodes_visited++;
 
+        // Debug: print first few nodes we visit
+        static int visit_count = 0;
+        if (visit_count < 10) {
+            std::cout << "DEBUG visit " << visit_count << ": node=" << current
+                      << " label=" << filter_set.GetLabel(current)
+                      << " dist=" << -neg_dist << std::endl;
+            visit_count++;
+        }
+
         // Check if matches filter
         if (filter_set.GetLabel(current) == target_label) {
             float vec_dist = graph.ComputeDistance(query, current);
@@ -1053,8 +1062,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v14" << std::endl;
-    std::cout << "debug mode: matching neighbors count" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v15" << std::endl;
+    std::cout << "debug mode: print first 10 visited nodes" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
