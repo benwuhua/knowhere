@@ -1020,6 +1020,12 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 }
 
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
+    // Print version info
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v3" << std::endl;
+    std::cout << "filter_weight = avg_distance" << std::endl;
+    std::cout << "========================================" << std::endl;
+
     // Get data path from environment or use default
     const char* env_path = std::getenv("SIFT1M_PATH");
     SIFT1MConfig cfg;
