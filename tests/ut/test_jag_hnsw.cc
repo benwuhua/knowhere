@@ -287,20 +287,33 @@ ComputeFilteredGroundTruth(const float* base_data, const float* query, int64_t n
 
 // ============== Label IDSelector for faiss ==============
 
-// Custom IDSelector that filters by label
+// Custom IDSelector that filters by label and tracks visits
 struct IDSelectorLabel : faiss::IDSelector {
     const knowhere::LabelFilterSet& filter_set;
     int32_t target_label;
+    mutable int64_t total_visits = 0;      // Track total visits
+    mutable int64_t valid_visits = 0;      // Track valid visits (matching filter)
 
     IDSelectorLabel(const knowhere::LabelFilterSet& fs, int32_t label)
         : filter_set(fs), target_label(label) {}
 
     bool
     is_member(faiss::idx_t id) const override {
+        total_visits++;
         if (id < 0 || id >= static_cast<faiss::idx_t>(filter_set.Size())) {
             return false;
         }
-        return filter_set.GetLabel(id) == target_label;
+        if (filter_set.GetLabel(id) == target_label) {
+            valid_visits++;
+            return true;
+        }
+        return false;
+    }
+
+    void
+    Reset() const {
+        total_visits = 0;
+        valid_visits = 0;
     }
 };
 
@@ -421,8 +434,9 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
     // Main beam search loop (like original WeightJAG)
     while (!frontier.empty() && result.nodes_visited < max_visits) {
         // Find first unvisited node in frontier
+        // Note: seen is an unordered_set, so count() returns 0 or 1 (not count-based like original JAG)
         int id = 0;
-        while (id < frontier.size() && seen.count(frontier[id].second) > 1) {
+        while (id < frontier.size() && seen.count(frontier[id].second) > 0) {
             id++;
         }
         if (id >= frontier.size() || id >= beam_size) {
@@ -815,6 +829,56 @@ LoadIBin(const std::string& filename, std::vector<int32_t>& data, int32_t& n) {
     return ifs.good() || ifs.eof();
 }
 
+// ============== Filter Weight Computation ==============
+
+// Compute standard deviation of a vector of values
+double
+ComputeStdDev(const std::vector<double>& values) {
+    if (values.empty()) return 0.0;
+    double sum = 0.0;
+    for (double v : values) sum += v;
+    double mean = sum / values.size();
+    double sq_sum = 0.0;
+    for (double v : values) sq_sum += (v - mean) * (v - mean);
+    return std::sqrt(sq_sum / values.size());
+}
+
+// Compute optimal filter_weight based on dataset statistics
+// Based on original JAG paper: filter_weight = inf * max_normalized_h
+// where normalized_h = std_dev(vector_dist) / std_dev(filter_dist)
+float
+ComputeOptimalFilterWeight(const float* base_data, int64_t n, int64_t dim,
+                           const knowhere::LabelFilterSet& filter_set,
+                           int samples = 100) {
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int64_t> dist(0, n - 1);
+
+    double max_normalized_h = 1.0;
+
+    // Sample points to compute normalized_h
+    int num_samples = std::min(1000L, n);
+    for (int p = 0; p < num_samples; p++) {
+        std::vector<double> vec_dists, filter_dists;
+
+        for (int i = 0; i < samples; i++) {
+            int64_t q = dist(rng);
+            const float* p_vec = base_data + p * dim;
+            const float* q_vec = base_data + q * dim;
+            vec_dists.push_back(L2DistanceSq(p_vec, q_vec, dim));
+            filter_dists.push_back(filter_set.GetLabel(p) == filter_set.GetLabel(q) ? 0.0 : 1.0);
+        }
+
+        double std_vec = ComputeStdDev(vec_dists);
+        double std_filter = ComputeStdDev(filter_dists);
+        if (std_filter > 1e-6) {
+            max_normalized_h = std::max(max_normalized_h, std_vec / std_filter);
+        }
+    }
+
+    // Use a large multiplier like original JAG
+    return static_cast<float>(max_normalized_h * 1e6);
+}
+
 // SIFT1M benchmark configuration
 struct SIFT1MConfig {
     std::string data_path = "./data";
@@ -822,10 +886,9 @@ struct SIFT1MConfig {
     int hnsw_m = 32;
     int hnsw_ef_construction = 200;
     int hnsw_ef = 256;
-    // filter_weight should be large enough to strongly penalize non-matching nodes
-    // Original JAG uses very large values (inf * max_normalized_h)
-    // For 128D L2 distance, typical max distance is ~50000, so use 100000
-    float filter_weight = 100000.0f;
+    // filter_weight = 0 means auto-calculate using ComputeOptimalFilterWeight
+    // Otherwise use the provided value
+    float filter_weight = 0.0f;
     int num_queries = 100;  // Number of queries to run
 };
 
@@ -880,12 +943,20 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
     // Create graph wrapper for JAG search
     RealHNSWGraph real_graph(&hnsw_index, base_data, dim);
 
+    // Compute optimal filter_weight if not specified
+    float filter_weight = cfg.filter_weight;
+    if (filter_weight == 0.0f) {
+        filter_weight = ComputeOptimalFilterWeight(base_data, n, dim, filter_set);
+    }
+
     // Aggregate metrics
     int total_baseline_hits = 0;
     int total_jag_hits = 0;
     int total_gt_count = 0;
     int64_t total_jag_visits = 0;
     int64_t total_jag_valid = 0;
+    int64_t total_baseline_visits = 0;  // Track baseline visits from IDSelector
+    int64_t total_baseline_valid = 0;   // Track baseline valid visits from IDSelector
 
     int queries_to_run = std::min(static_cast<int64_t>(cfg.num_queries), nq);
 
@@ -901,6 +972,9 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
         std::set<int64_t> gt_set(gt.begin(), gt.end());
         total_gt_count += gt.size();
 
+        // Reset IDSelector visit counters for this query
+        label_selector.Reset();
+
         // Run baseline using faiss native search with IDSelector
         hnsw_index.search(1, query, cfg.k, distances.data(), labels.data(), &search_params);
         for (int i = 0; i < cfg.k; i++) {
@@ -909,9 +983,13 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
             }
         }
 
+        // Accumulate baseline visit counts
+        total_baseline_visits += label_selector.total_visits;
+        total_baseline_valid += label_selector.valid_visits;
+
         // Run JAG search on real HNSW graph (filter-guided)
         auto real_jag = SearchJAGReal(real_graph, query, cfg.k, filter_set, target_label,
-                                      cfg.filter_weight, cfg.hnsw_ef, cfg.hnsw_ef * 10);
+                                      filter_weight, cfg.hnsw_ef, cfg.hnsw_ef * 10);
         for (auto id : real_jag.ids) {
             if (gt_set.count(id)) {
                 total_jag_hits++;
@@ -928,13 +1006,14 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
     result.jag_recall = (total_gt_count > 0)
         ? static_cast<float>(total_jag_hits) / total_gt_count : 0.0f;
 
-    // For baseline, we don't track visits - use filter_ratio as estimate
-    // Faiss HNSW visits roughly efSearch nodes on average
-    result.baseline_nodes_visited = cfg.hnsw_ef;
+    // Use tracked baseline visits (if available), otherwise estimate
+    result.baseline_nodes_visited = (total_baseline_visits > 0)
+        ? total_baseline_visits / queries_to_run : cfg.hnsw_ef;
     result.jag_nodes_visited = total_jag_visits / queries_to_run;
 
-    // Baseline valid ratio equals filter ratio (random selection)
-    result.baseline_valid_ratio = result.filter_ratio;
+    // Use tracked baseline valid ratio (if available), otherwise use filter_ratio
+    result.baseline_valid_ratio = (total_baseline_visits > 0)
+        ? static_cast<float>(total_baseline_valid) / total_baseline_visits : result.filter_ratio;
     result.jag_valid_ratio = (total_jag_visits > 0)
         ? static_cast<float>(total_jag_valid) / total_jag_visits : 0.0f;
 
@@ -995,7 +1074,11 @@ TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     std::cout << "Queries: " << nq << " (using " << cfg.num_queries << ")" << std::endl;
     std::cout << "K: " << cfg.k << std::endl;
     std::cout << "HNSW: M=" << cfg.hnsw_m << ", ef=" << cfg.hnsw_ef << std::endl;
-    std::cout << "JAG Filter Weight: " << cfg.filter_weight << std::endl;
+    if (cfg.filter_weight == 0.0f) {
+        std::cout << "JAG Filter Weight: auto-computed per query" << std::endl;
+    } else {
+        std::cout << "JAG Filter Weight: " << cfg.filter_weight << std::endl;
+    }
     std::cout << "========================================\n" << std::endl;
 
     // Test multiple filter ratios
