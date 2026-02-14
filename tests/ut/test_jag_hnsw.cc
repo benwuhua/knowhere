@@ -400,22 +400,15 @@ class RealHNSWGraph {
     }
 };
 
-// JAG search on real HNSW graph (filter-guided)
-// Based on WeightJAG from the original paper:
+// JAG search on real HNSW graph (simplified version for debugging)
 // combined_dist = vec_dist + filter_weight * filter_distance
-// Key: uses count-based visited tracking (original JAG approach)
 SearchResult
 SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
               const knowhere::LabelFilterSet& filter_set, int32_t target_label,
               float filter_weight, int beam_size = 256, int max_visits = 10000) {
     SearchResult result;
-    // Count-based tracking (original JAG):
-    // - count < 2: can be visited (in frontier or never seen)
-    // - count >= 2: fully visited, skip
-    std::unordered_map<int64_t, int> visit_count;
-    // Use priority queue for efficient min extraction
-    // (negative distance for min-heap behavior)
-    std::priority_queue<std::pair<float, int64_t>> frontier;
+    std::unordered_set<int64_t> visited;
+    std::priority_queue<std::pair<float, int64_t>> frontier;  // (-dist, node)
     std::vector<std::pair<float, int64_t>> matched;
 
     // Combined distance function
@@ -424,73 +417,21 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
         return vec_dist + filter_weight * filter_dist;
     };
 
-    // Find a good entry point that matches the filter
-    // First do normal greedy search to upper layers
+    // Start from entry point
     int64_t entry = graph.GreedySearchToUpperLayers(query);
     if (entry < 0 || entry >= graph.size()) {
         entry = 0;
     }
 
-    // If entry doesn't match, do BFS to find nearest matching node
-    if (filter_set.GetLabel(entry) != target_label) {
-        std::queue<int64_t> bfs_queue;
-        std::unordered_set<int64_t> bfs_visited;
-        bfs_queue.push(entry);
-        bfs_visited.insert(entry);
-
-        int bfs_limit = 1000;  // Limit BFS search
-        float best_dist = std::numeric_limits<float>::max();
-        int64_t best_match = -1;
-
-        while (!bfs_queue.empty() && bfs_limit > 0) {
-            int64_t current = bfs_queue.front();
-            bfs_queue.pop();
-            bfs_limit--;
-
-            if (filter_set.GetLabel(current) == target_label) {
-                float dist = graph.ComputeDistance(query, current);
-                if (dist < best_dist) {
-                    best_dist = dist;
-                    best_match = current;
-                }
-            }
-
-            // Explore neighbors
-            auto neighbors = graph.GetNeighbors(current, 0);
-            for (int64_t neighbor : neighbors) {
-                if (neighbor >= 0 && neighbor < graph.size() && !bfs_visited.count(neighbor)) {
-                    bfs_visited.insert(neighbor);
-                    bfs_queue.push(neighbor);
-                }
-            }
-        }
-
-        if (best_match >= 0) {
-            entry = best_match;
-        }
-    }
-
-    // Initialize
     float entry_vec_dist = graph.ComputeDistance(query, entry);
-    frontier.push({-combined_dist(entry_vec_dist, entry), entry});  // negative for min-heap
-    visit_count[entry] = 1;
+    frontier.push({-combined_dist(entry_vec_dist, entry), entry});
 
-    int frontier_size = 1;
-
-    // Main search loop
     while (!frontier.empty() && result.nodes_visited < max_visits) {
-        // Get node with minimum combined distance
-        auto [neg_combined, current] = frontier.top();
+        auto [neg_dist, current] = frontier.top();
         frontier.pop();
-        frontier_size--;
 
-        // Skip if already fully visited
-        if (visit_count[current] >= 2) {
-            continue;
-        }
-
-        // Mark as fully visited and process
-        visit_count[current] = 2;
+        if (visited.count(current)) continue;
+        visited.insert(current);
         result.nodes_visited++;
 
         // Check if matches filter
@@ -500,7 +441,7 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
             result.valid_visits++;
         }
 
-        // Stop if we have enough matches (high oversearch for filtered search)
+        // Stop if we have enough matches
         if (static_cast<int>(matched.size()) >= k * 50) {
             break;
         }
@@ -508,26 +449,12 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
         // Explore neighbors
         auto neighbors = graph.GetNeighbors(current, 0);
         for (int64_t neighbor : neighbors) {
-            if (neighbor < 0 || neighbor >= graph.size()) {
+            if (neighbor < 0 || neighbor >= graph.size() || visited.count(neighbor)) {
                 continue;
             }
-            // Skip if already fully visited
-            if (visit_count[neighbor] >= 2) {
-                continue;
-            }
-
             float vec_dist = graph.ComputeDistance(query, neighbor);
             float combined = combined_dist(vec_dist, neighbor);
-
-            // Add to frontier (allow duplicates, will skip later if visited)
-            if (visit_count[neighbor] < 1) {
-                visit_count[neighbor] = 1;  // Mark as in frontier
-            }
             frontier.push({-combined, neighbor});
-            frontier_size++;
-
-            // Limit frontier size by pruning (not strictly needed with skip logic)
-            // but helps with memory
         }
     }
 
@@ -1065,8 +992,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v9" << std::endl;
-    std::cout << "filter_weight = 0 (test baseline)" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v10" << std::endl;
+    std::cout << "simplified search, no BFS, filter_weight=0" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
