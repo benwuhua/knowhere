@@ -460,8 +460,8 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
             result.valid_visits++;
         }
 
-        // Stop if we have enough matches
-        if (static_cast<int>(matched.size()) >= k * 10) {
+        // Stop if we have enough matches (high oversearch for filtered search)
+        if (static_cast<int>(matched.size()) >= k * 50) {
             break;
         }
 
@@ -846,12 +846,12 @@ ComputeStdDev(const std::vector<double>& values) {
 }
 
 // Compute optimal filter_weight based on dataset statistics
-// The key insight: filter_weight should give preference to matching nodes
-// but still allow exploration through non-matching nodes to reach matching ones.
-// Using 0.5-1.0x avg distance works better than large multipliers.
+// Smaller values allow more exploration through non-matching nodes
+// Larger values prioritize matching nodes more aggressively
+// Trade-off: recall vs valid_visit_ratio
 float
 ComputeOptimalFilterWeight(const float* base_data, int64_t n, int64_t dim,
-                           int samples = 1000) {
+                           float aggressiveness = 0.3f, int samples = 1000) {
     std::mt19937 rng(42);
     std::uniform_int_distribution<int64_t> dist(0, n - 1);
 
@@ -874,9 +874,10 @@ ComputeOptimalFilterWeight(const float* base_data, int64_t n, int64_t dim,
 
     double avg_dist = (count > 0) ? sum_vec_dist / count : 10000.0;
 
-    // Use 1x average distance as filter_weight
-    // This gives preference to matching nodes but allows exploration
-    return static_cast<float>(avg_dist);
+    // Use aggressiveness * average distance as filter_weight
+    // Lower values = more exploration, higher recall, lower valid_ratio
+    // Higher values = less exploration, lower recall, higher valid_ratio
+    return static_cast<float>(avg_dist * aggressiveness);
 }
 
 // SIFT1M benchmark configuration
@@ -1024,8 +1025,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v5" << std::endl;
-    std::cout << "priority_queue + count-based tracking" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v6" << std::endl;
+    std::cout << "filter_weight = 0.3 * avg_dist, oversearch = 50x" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
