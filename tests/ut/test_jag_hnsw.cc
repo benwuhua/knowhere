@@ -326,13 +326,22 @@ class RealHNSWGraph {
         return index->hnsw.entry_point;
     }
 
+    int
+    GetMaxLevel() const {
+        return index->hnsw.max_level;
+    }
+
+    int
+    GetNodeLevel(int64_t node_id) const {
+        return index->hnsw.levels[node_id];
+    }
+
     std::vector<int64_t>
-    GetNeighbors(int64_t node_id) const {
+    GetNeighbors(int64_t node_id, int level = 0) const {
         std::vector<int64_t> neighbors;
         const auto& hnsw = index->hnsw;
         size_t begin, end;
-        // Get neighbors from layer 0 (the base layer with all connections)
-        hnsw.neighbor_range(node_id, 0, &begin, &end);
+        hnsw.neighbor_range(node_id, level, &begin, &end);
         for (size_t i = begin; i < end; i++) {
             int32_t neighbor = hnsw.neighbors[i];
             if (neighbor != -1 && neighbor != node_id) {
@@ -347,87 +356,72 @@ class RealHNSWGraph {
         const float* vec = base_data + node_id * dim;
         return L2DistanceSq(query, vec, dim);
     }
-};
 
-// Baseline search on real HNSW graph (post-filter)
-SearchResult
-SearchBaselineReal(const RealHNSWGraph& graph, const float* query, int k,
-                   const knowhere::LabelFilterSet& filter_set, int32_t target_label,
-                   int64_t max_visits = 10000) {
-    SearchResult result;
-    std::unordered_set<int64_t> visited;
-    std::priority_queue<std::pair<float, int64_t>> frontier;
-    std::vector<std::pair<float, int64_t>> candidates;
+    // Greedy search from upper layers to find a good entry point for layer 0
+    // Returns the nearest node in layer 0 after traversing from top
+    int64_t
+    GreedySearchToUpperLayers(const float* query) const {
+        int64_t nearest = GetEntryPoint();
+        if (nearest < 0) return 0;
 
-    // Start from entry point
-    int64_t entry = graph.GetEntryPoint();
-    if (entry < 0 || entry >= graph.size()) {
-        entry = 0;  // Fallback to node 0 if entry point is invalid
-    }
-    float entry_dist = graph.ComputeDistance(query, entry);
-    frontier.push({-entry_dist, entry});
+        float d_nearest = ComputeDistance(query, nearest);
 
-    while (!frontier.empty() && result.nodes_visited < max_visits) {
-        auto [neg_dist, current] = frontier.top();
-        frontier.pop();
-
-        if (visited.count(current)) continue;
-        visited.insert(current);
-        result.nodes_visited++;
-
-        if (filter_set.GetLabel(current) == target_label) {
-            candidates.push_back({-neg_dist, current});
-            result.valid_visits++;
-        }
-
-        // Explore neighbors from real HNSW graph
-        auto neighbors = graph.GetNeighbors(current);
-        for (int64_t neighbor : neighbors) {
-            if (!visited.count(neighbor) && neighbor >= 0 && neighbor < graph.size()) {
-                float dist = graph.ComputeDistance(query, neighbor);
-                frontier.push({-dist, neighbor});
+        // Traverse from max_level down to level 1
+        for (int level = GetMaxLevel(); level >= 1; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                auto neighbors = GetNeighbors(nearest, level);
+                for (int64_t neighbor : neighbors) {
+                    float d = ComputeDistance(query, neighbor);
+                    if (d < d_nearest) {
+                        d_nearest = d;
+                        nearest = neighbor;
+                        changed = true;
+                    }
+                }
             }
         }
-    }
 
-    std::sort(candidates.begin(), candidates.end());
-    for (int i = 0; i < std::min(k, (int)candidates.size()); i++) {
-        result.ids.push_back(candidates[i].second);
+        return nearest;
     }
-
-    return result;
-}
+};
 
 // JAG search on real HNSW graph (filter-guided)
 SearchResult
 SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
               const knowhere::LabelFilterSet& filter_set, int32_t target_label,
-              float filter_weight, int64_t max_visits = 10000) {
+              float filter_weight, int ef_search = 256) {
     SearchResult result;
     std::unordered_set<int64_t> visited;
+    // Use a larger buffer for better recall
     std::priority_queue<std::pair<float, int64_t>> frontier;
     std::vector<std::pair<float, int64_t>> matched;
 
     // Combined distance function: vector distance + filter penalty
+    // Scale filter_weight relative to expected vector distance range
     auto combined_dist = [&](float vec_dist, int64_t node_id) {
         int filter_dist = (filter_set.GetLabel(node_id) == target_label) ? 0 : 1;
-        return vec_dist + filter_weight * filter_dist;
+        return vec_dist * (1.0f + filter_weight * filter_dist);
     };
 
-    // Start from entry point
-    int64_t entry = graph.GetEntryPoint();
+    // Phase 1: Multi-layer greedy search to find good entry point for layer 0
+    int64_t entry = graph.GreedySearchToUpperLayers(query);
     if (entry < 0 || entry >= graph.size()) {
         entry = 0;
     }
+
+    // Phase 2: Beam search at layer 0 with combined distance
     float entry_vec_dist = graph.ComputeDistance(query, entry);
     frontier.push({-combined_dist(entry_vec_dist, entry), entry});
 
-    while (!frontier.empty() && result.nodes_visited < max_visits && (int)matched.size() < k * 10) {
+    // Track visited nodes
+    visited.insert(entry);
+
+    while (!frontier.empty() && (int)matched.size() < ef_search) {
         auto [neg_combined, current] = frontier.top();
         frontier.pop();
 
-        if (visited.count(current)) continue;
-        visited.insert(current);
         result.nodes_visited++;
 
         if (filter_set.GetLabel(current) == target_label) {
@@ -436,16 +430,18 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
             result.valid_visits++;
         }
 
-        // Explore neighbors from real HNSW graph
-        auto neighbors = graph.GetNeighbors(current);
+        // Explore neighbors from real HNSW graph (layer 0)
+        auto neighbors = graph.GetNeighbors(current, 0);
         for (int64_t neighbor : neighbors) {
             if (!visited.count(neighbor) && neighbor >= 0 && neighbor < graph.size()) {
+                visited.insert(neighbor);
                 float vec_dist = graph.ComputeDistance(query, neighbor);
                 frontier.push({-combined_dist(vec_dist, neighbor), neighbor});
             }
         }
     }
 
+    // Sort matched by actual vector distance and return top-k
     std::sort(matched.begin(), matched.end());
     for (int i = 0; i < std::min(k, (int)matched.size()); i++) {
         result.ids.push_back(matched[i].second);
@@ -877,7 +873,7 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
         }
 
         // Run JAG search on real HNSW graph (filter-guided)
-        auto real_jag = SearchJAGReal(real_graph, query, cfg.k, filter_set, target_label, cfg.filter_weight);
+        auto real_jag = SearchJAGReal(real_graph, query, cfg.k, filter_set, target_label, cfg.filter_weight, cfg.hnsw_ef);
         for (auto id : real_jag.ids) {
             if (gt_set.count(id)) {
                 total_jag_hits++;
