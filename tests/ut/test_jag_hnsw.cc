@@ -400,8 +400,36 @@ class RealHNSWGraph {
     }
 };
 
+// Simple test: use faiss native search to verify our graph access is correct
+SearchResult
+SearchFaissNative(faiss::IndexHNSWFlat& hnsw_index, const float* query, int k,
+                  const knowhere::LabelFilterSet& filter_set, int32_t target_label) {
+    SearchResult result;
+
+    // Create IDSelector
+    IDSelectorLabel selector(filter_set, target_label);
+
+    // Search with filter
+    std::vector<float> distances(k);
+    std::vector<faiss::idx_t> labels(k);
+
+    faiss::SearchParametersHNSW params;
+    params.sel = &selector;
+    params.efSearch = 256;
+
+    hnsw_index.search(1, query, k, distances.data(), labels.data(), &params);
+
+    // Extract results
+    for (int i = 0; i < k; i++) {
+        if (labels[i] >= 0) {
+            result.ids.push_back(labels[i]);
+        }
+    }
+
+    return result;
+}
+
 // JAG search on real HNSW graph (simplified version for debugging)
-// combined_dist = vec_dist + filter_weight * filter_distance
 SearchResult
 SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
               const knowhere::LabelFilterSet& filter_set, int32_t target_label,
@@ -421,6 +449,14 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
     int64_t entry = graph.GreedySearchToUpperLayers(query);
     if (entry < 0 || entry >= graph.size()) {
         entry = 0;
+    }
+
+    // Debug: print entry point info
+    static bool debug_printed = false;
+    if (!debug_printed) {
+        auto entry_neighbors = graph.GetNeighbors(entry, 0);
+        std::cout << "DEBUG: entry=" << entry << ", level0_neighbors=" << entry_neighbors.size() << std::endl;
+        debug_printed = true;
     }
 
     float entry_vec_dist = graph.ComputeDistance(query, entry);
@@ -455,6 +491,15 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
             float vec_dist = graph.ComputeDistance(query, neighbor);
             float combined = combined_dist(vec_dist, neighbor);
             frontier.push({-combined, neighbor});
+        }
+    }
+
+    // Debug: print how many matches we found
+    if (matched.empty()) {
+        static int empty_count = 0;
+        if (empty_count < 3) {
+            std::cout << "DEBUG: No matches found! visited=" << result.nodes_visited << std::endl;
+            empty_count++;
         }
     }
 
@@ -992,8 +1037,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v10" << std::endl;
-    std::cout << "simplified search, no BFS, filter_weight=0" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v11" << std::endl;
+    std::cout << "debug mode: compare faiss native vs custom search" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
