@@ -1037,8 +1037,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v11" << std::endl;
-    std::cout << "debug mode: compare faiss native vs custom search" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v12" << std::endl;
+    std::cout << "debug mode: print label distribution" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
@@ -1086,6 +1086,20 @@ TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     for (int32_t i = 0; i < n; i++) {
         filter_set.label_to_ids[filter_set.labels[i]].push_back(i);
     }
+
+    // Debug: print label distribution
+    std::cout << "\nDEBUG: Label distribution:" << std::endl;
+    std::vector<std::pair<int32_t, size_t>> label_debug;
+    for (const auto& [label, ids] : filter_set.label_to_ids) {
+        label_debug.push_back({label, ids.size()});
+    }
+    std::sort(label_debug.begin(), label_debug.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (size_t i = 0; i < std::min(label_debug.size(), size_t(10)); i++) {
+        std::cout << "  Label " << label_debug[i].first << ": " << label_debug[i].second
+                  << " (" << (100.0 * label_debug[i].second / n) << "%)" << std::endl;
+    }
+    std::cout << "  Total unique labels: " << label_debug.size() << std::endl;
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "JAG-HNSW SIFT1M Benchmark" << std::endl;
