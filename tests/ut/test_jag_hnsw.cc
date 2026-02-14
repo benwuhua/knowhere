@@ -409,15 +409,16 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
               const knowhere::LabelFilterSet& filter_set, int32_t target_label,
               float filter_weight, int beam_size = 256, int max_visits = 10000) {
     SearchResult result;
-    // Count-based tracking (original JAG): node can be visited if count < 2
-    // count=0: never seen
-    // count=1: in frontier, not yet visited
-    // count=2: fully visited
+    // Count-based tracking (original JAG):
+    // - count < 2: can be visited (in frontier or never seen)
+    // - count >= 2: fully visited, skip
     std::unordered_map<int64_t, int> visit_count;
-    std::vector<std::pair<float, int64_t>> frontier;  // (combined_dist, node_id)
-    std::vector<std::pair<float, int64_t>> matched;   // (vec_dist, node_id) for results
+    // Use priority queue for efficient min extraction
+    // (negative distance for min-heap behavior)
+    std::priority_queue<std::pair<float, int64_t>> frontier;
+    std::vector<std::pair<float, int64_t>> matched;
 
-    // Combined distance function: vector distance + filter penalty
+    // Combined distance function
     auto combined_dist = [&](float vec_dist, int64_t node_id) {
         int filter_dist = (filter_set.GetLabel(node_id) == target_label) ? 0 : 1;
         return vec_dist + filter_weight * filter_dist;
@@ -429,32 +430,39 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
         entry = 0;
     }
 
-    // Initialize frontier with entry point
+    // Initialize
     float entry_vec_dist = graph.ComputeDistance(query, entry);
-    frontier.push_back({combined_dist(entry_vec_dist, entry), entry});
-    visit_count[entry] = 1;  // In frontier
+    frontier.push({-combined_dist(entry_vec_dist, entry), entry});  // negative for min-heap
+    visit_count[entry] = 1;
 
-    // Main beam search loop (like original WeightJAG)
+    int frontier_size = 1;
+
+    // Main search loop
     while (!frontier.empty() && result.nodes_visited < max_visits) {
-        // Find first node with count < 2 (original JAG: skip if count >= 2)
-        int id = 0;
-        while (id < static_cast<int>(frontier.size()) && visit_count[frontier[id].second] >= 2) {
-            id++;
-        }
-        if (id >= static_cast<int>(frontier.size()) || id >= beam_size) {
-            break;
+        // Get node with minimum combined distance
+        auto [neg_combined, current] = frontier.top();
+        frontier.pop();
+        frontier_size--;
+
+        // Skip if already fully visited
+        if (visit_count[current] >= 2) {
+            continue;
         }
 
-        // Visit the next node
-        auto [combined, current] = frontier[id];
+        // Mark as fully visited and process
+        visit_count[current] = 2;
         result.nodes_visited++;
-        visit_count[current] = 2;  // Mark as fully visited
 
-        // Check if this node matches the filter
+        // Check if matches filter
         if (filter_set.GetLabel(current) == target_label) {
             float vec_dist = graph.ComputeDistance(query, current);
             matched.push_back({vec_dist, current});
             result.valid_visits++;
+        }
+
+        // Stop if we have enough matches
+        if (static_cast<int>(matched.size()) >= k * 10) {
+            break;
         }
 
         // Explore neighbors
@@ -463,8 +471,7 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
             if (neighbor < 0 || neighbor >= graph.size()) {
                 continue;
             }
-
-            // Skip if already fully visited (count >= 2)
+            // Skip if already fully visited
             if (visit_count[neighbor] >= 2) {
                 continue;
             }
@@ -472,33 +479,21 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
             float vec_dist = graph.ComputeDistance(query, neighbor);
             float combined = combined_dist(vec_dist, neighbor);
 
-            // Early termination: skip if combined dist is too large
-            if (frontier.size() >= static_cast<size_t>(beam_size)) {
-                float last_dist = frontier.back().first;
-                if (combined > last_dist) {
-                    continue;
-                }
+            // Add to frontier (allow duplicates, will skip later if visited)
+            if (visit_count[neighbor] < 1) {
+                visit_count[neighbor] = 1;  // Mark as in frontier
             }
+            frontier.push({-combined, neighbor});
+            frontier_size++;
 
-            // Add to frontier if not already there
-            if (visit_count[neighbor] == 0) {
-                // Insert sorted
-                auto pos = std::upper_bound(frontier.begin(), frontier.end(),
-                                            std::make_pair(combined, neighbor));
-                frontier.insert(pos, {combined, neighbor});
-                visit_count[neighbor] = 1;
-            }
-
-            // Keep frontier bounded
-            if (frontier.size() > static_cast<size_t>(beam_size * 2)) {
-                frontier.resize(beam_size);
-            }
+            // Limit frontier size by pruning (not strictly needed with skip logic)
+            // but helps with memory
         }
     }
 
-    // Sort matched by actual vector distance and return top-k
+    // Sort matched by vector distance and return top-k
     std::sort(matched.begin(), matched.end());
-    for (int i = 0; i < std::min(k, (int)matched.size()); i++) {
+    for (int i = 0; i < std::min(k, static_cast<int>(matched.size())); i++) {
         result.ids.push_back(matched[i].second);
     }
 
@@ -1029,8 +1024,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v4" << std::endl;
-    std::cout << "filter_weight = avg_distance, count-based tracking" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v5" << std::endl;
+    std::cout << "priority_queue + count-based tracking" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
