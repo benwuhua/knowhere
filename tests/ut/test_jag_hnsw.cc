@@ -403,24 +403,27 @@ class RealHNSWGraph {
 // JAG search on real HNSW graph (filter-guided)
 // Based on WeightJAG from the original paper:
 // combined_dist = vec_dist + filter_weight * filter_distance
+// Key: uses count-based visited tracking (original JAG approach)
 SearchResult
 SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
               const knowhere::LabelFilterSet& filter_set, int32_t target_label,
               float filter_weight, int beam_size = 256, int max_visits = 10000) {
     SearchResult result;
-    std::unordered_set<int64_t> seen;  // Track all seen nodes
+    // Count-based tracking (original JAG): node can be visited if count < 2
+    // count=0: never seen
+    // count=1: in frontier, not yet visited
+    // count=2: fully visited
+    std::unordered_map<int64_t, int> visit_count;
     std::vector<std::pair<float, int64_t>> frontier;  // (combined_dist, node_id)
-    std::vector<std::pair<float, int64_t>> visited;   // (combined_dist, node_id)
     std::vector<std::pair<float, int64_t>> matched;   // (vec_dist, node_id) for results
 
-    // Combined distance function: vector distance + filter penalty (additive, like original)
-    // filter_distance = 0 if label matches, 1 if not
+    // Combined distance function: vector distance + filter penalty
     auto combined_dist = [&](float vec_dist, int64_t node_id) {
         int filter_dist = (filter_set.GetLabel(node_id) == target_label) ? 0 : 1;
         return vec_dist + filter_weight * filter_dist;
     };
 
-    // Start from entry point (like original JAG which starts from node 0)
+    // Start from entry point
     int64_t entry = graph.GreedySearchToUpperLayers(query);
     if (entry < 0 || entry >= graph.size()) {
         entry = 0;
@@ -429,25 +432,23 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
     // Initialize frontier with entry point
     float entry_vec_dist = graph.ComputeDistance(query, entry);
     frontier.push_back({combined_dist(entry_vec_dist, entry), entry});
-    seen.insert(entry);
+    visit_count[entry] = 1;  // In frontier
 
     // Main beam search loop (like original WeightJAG)
     while (!frontier.empty() && result.nodes_visited < max_visits) {
-        // Find first unvisited node in frontier
-        // Note: seen is an unordered_set, so count() returns 0 or 1 (not count-based like original JAG)
+        // Find first node with count < 2 (original JAG: skip if count >= 2)
         int id = 0;
-        while (id < frontier.size() && seen.count(frontier[id].second) > 0) {
+        while (id < static_cast<int>(frontier.size()) && visit_count[frontier[id].second] >= 2) {
             id++;
         }
-        if (id >= frontier.size() || id >= beam_size) {
+        if (id >= static_cast<int>(frontier.size()) || id >= beam_size) {
             break;
         }
 
         // Visit the next node
         auto [combined, current] = frontier[id];
-        visited.push_back({combined, current});
         result.nodes_visited++;
-        seen.insert(current);
+        visit_count[current] = 2;  // Mark as fully visited
 
         // Check if this node matches the filter
         if (filter_set.GetLabel(current) == target_label) {
@@ -459,32 +460,38 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
         // Explore neighbors
         auto neighbors = graph.GetNeighbors(current, 0);
         for (int64_t neighbor : neighbors) {
-            if (seen.count(neighbor) || neighbor < 0 || neighbor >= graph.size()) {
+            if (neighbor < 0 || neighbor >= graph.size()) {
                 continue;
             }
 
-            // Early termination: skip if filter distance is too large
-            int filter_dist = (filter_set.GetLabel(neighbor) == target_label) ? 0 : 1;
-            if (frontier.size() >= beam_size) {
-                float last_dist = frontier[beam_size - 1].first;
-                if (filter_weight * filter_dist > last_dist) {
-                    seen.insert(neighbor);  // Mark as seen but don't add to frontier
+            // Skip if already fully visited (count >= 2)
+            if (visit_count[neighbor] >= 2) {
+                continue;
+            }
+
+            float vec_dist = graph.ComputeDistance(query, neighbor);
+            float combined = combined_dist(vec_dist, neighbor);
+
+            // Early termination: skip if combined dist is too large
+            if (frontier.size() >= static_cast<size_t>(beam_size)) {
+                float last_dist = frontier.back().first;
+                if (combined > last_dist) {
                     continue;
                 }
             }
 
-            seen.insert(neighbor);
-            float vec_dist = graph.ComputeDistance(query, neighbor);
-            float combined = combined_dist(vec_dist, neighbor);
-
-            // Insert sorted (like original)
-            auto pos = std::upper_bound(frontier.begin(), frontier.end(),
-                                        std::make_pair(combined, neighbor));
-            frontier.insert(pos, {combined, neighbor});
+            // Add to frontier if not already there
+            if (visit_count[neighbor] == 0) {
+                // Insert sorted
+                auto pos = std::upper_bound(frontier.begin(), frontier.end(),
+                                            std::make_pair(combined, neighbor));
+                frontier.insert(pos, {combined, neighbor});
+                visit_count[neighbor] = 1;
+            }
 
             // Keep frontier bounded
-            if (frontier.size() > beam_size) {
-                frontier.pop_back();
+            if (frontier.size() > static_cast<size_t>(beam_size * 2)) {
+                frontier.resize(beam_size);
             }
         }
     }
@@ -1022,8 +1029,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v3" << std::endl;
-    std::cout << "filter_weight = avg_distance" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-14-v4" << std::endl;
+    std::cout << "filter_weight = avg_distance, count-based tracking" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
