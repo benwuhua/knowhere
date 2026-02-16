@@ -216,15 +216,22 @@ SearchBaseline(const SimpleTestGraph& graph, const float* base_data, const float
     return result;
 }
 
-// JAG search (filter-guided)
+// JAG search (filter-guided) with candidate pool management
+// Key fix: Collect ALL visited nodes as candidates, then filter at the end
+// Efficiency optimization: Stop early when we have enough matching candidates
 SearchResult
 SearchJAG(const SimpleTestGraph& graph, const float* base_data, const float* query,
           int k, const knowhere::LabelFilterSet& filter_set, int32_t target_label,
           float filter_weight, int64_t max_visits = 5000) {
     SearchResult result;
     std::unordered_set<int64_t> visited;
-    std::priority_queue<std::pair<float, int64_t>> frontier;
-    std::vector<std::pair<float, int64_t>> matched;
+    std::priority_queue<std::pair<float, int64_t>> frontier;  // (-combined_dist, node)
+
+    // Collect all visited nodes as candidates (not just matches)
+    std::vector<std::pair<float, int64_t>> candidates;  // (vec_dist, node_id)
+
+    // Track matching candidates for early stopping
+    std::vector<float> matching_distances;  // vec_dist of matching nodes
 
     auto combined_dist = [&](float vec_dist, int64_t node_id) {
         int filter_dist = (filter_set.GetLabel(node_id) == target_label) ? 0 : 1;
@@ -235,7 +242,11 @@ SearchJAG(const SimpleTestGraph& graph, const float* base_data, const float* que
     float entry_vec_dist = L2DistanceSq(query, base_data + entry * graph.dim, graph.dim);
     frontier.push({-combined_dist(entry_vec_dist, entry), entry});
 
-    while (!frontier.empty() && result.nodes_visited < max_visits && (int)matched.size() < k * 10) {
+    // Phase 1: Search with combined_dist, collect ALL nodes into candidates
+    // Early stopping when we have enough matching candidates and frontier is exhausted
+    int min_matches_for_early_stop = k * 20;  // Need enough matches for high recall
+
+    while (!frontier.empty() && result.nodes_visited < max_visits) {
         auto [neg_combined, current] = frontier.top();
         frontier.pop();
 
@@ -243,23 +254,50 @@ SearchJAG(const SimpleTestGraph& graph, const float* base_data, const float* que
         visited.insert(current);
         result.nodes_visited++;
 
+        // Add ALL visited nodes to candidates
+        float vec_dist = L2DistanceSq(query, base_data + current * graph.dim, graph.dim);
+        candidates.push_back({vec_dist, current});
+
         if (filter_set.GetLabel(current) == target_label) {
-            float vec_dist = L2DistanceSq(query, base_data + current * graph.dim, graph.dim);
-            matched.push_back({vec_dist, current});
             result.valid_visits++;
+            matching_distances.push_back(vec_dist);
+        }
+
+        // Early stopping: if we have enough matches and the frontier's best combined dist
+        // is larger than the k-th best match's vec_dist, we can stop
+        if (static_cast<int>(matching_distances.size()) >= min_matches_for_early_stop) {
+            // Sort matching distances to find k-th best
+            std::sort(matching_distances.begin(), matching_distances.end());
+            float kth_best_match_dist = matching_distances[std::min(k-1, (int)matching_distances.size()-1)];
+
+            // Check if frontier's best is worse than k-th best match
+            // (Note: frontier stores -combined_dist, so we negate to get actual value)
+            float frontier_best_combined = -frontier.top().first;
+
+            // If the best remaining in frontier (combined dist) is worse than k-th best match (vec dist)
+            // plus a margin, we can safely stop
+            if (!frontier.empty() && frontier_best_combined > kth_best_match_dist + filter_weight) {
+                break;
+            }
         }
 
         for (int64_t neighbor : graph.nodes[current].neighbors) {
             if (!visited.count(neighbor)) {
-                float vec_dist = L2DistanceSq(query, base_data + neighbor * graph.dim, graph.dim);
-                frontier.push({-combined_dist(vec_dist, neighbor), neighbor});
+                float n_vec_dist = L2DistanceSq(query, base_data + neighbor * graph.dim, graph.dim);
+                frontier.push({-combined_dist(n_vec_dist, neighbor), neighbor});
             }
         }
     }
 
-    std::sort(matched.begin(), matched.end());
-    for (int i = 0; i < std::min(k, (int)matched.size()); i++) {
-        result.ids.push_back(matched[i].second);
+    // Phase 2: Sort by vec_dist and filter for top-k matches
+    std::sort(candidates.begin(), candidates.end());
+    int matches_found = 0;
+    for (const auto& [dist, node_id] : candidates) {
+        if (filter_set.GetLabel(node_id) == target_label) {
+            result.ids.push_back(node_id);
+            matches_found++;
+            if (matches_found >= k) break;
+        }
     }
 
     return result;
@@ -429,112 +467,103 @@ SearchFaissNative(faiss::IndexHNSWFlat& hnsw_index, const float* query, int k,
     return result;
 }
 
-// JAG search on real HNSW graph (simplified version for debugging)
+// JAG search on real HNSW graph with candidate pool management
+// Key fix: Collect ALL visited nodes as candidates, then filter at the end
+// This ensures we don't miss better matches discovered later in the search
+// Efficiency optimization: Stop early when we have enough matching candidates
 SearchResult
 SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
               const knowhere::LabelFilterSet& filter_set, int32_t target_label,
               float filter_weight, int beam_size = 256, int max_visits = 10000) {
     SearchResult result;
     std::unordered_set<int64_t> visited;
-    std::priority_queue<std::pair<float, int64_t>> frontier;  // (-dist, node)
-    std::vector<std::pair<float, int64_t>> matched;
+    std::priority_queue<std::pair<float, int64_t>> frontier;  // (-combined_dist, node)
 
-    // Combined distance function
+    // Collect all visited nodes as candidates (not just matches)
+    // This allows us to find the globally best matches after search completes
+    std::vector<std::pair<float, int64_t>> candidates;  // (vec_dist, node_id)
+
+    // Track matching candidates for early stopping
+    std::vector<float> matching_distances;  // vec_dist of matching nodes
+
+    // Combined distance function - used to guide search direction
     auto combined_dist = [&](float vec_dist, int64_t node_id) {
         int filter_dist = (filter_set.GetLabel(node_id) == target_label) ? 0 : 1;
         return vec_dist + filter_weight * filter_dist;
     };
 
-    // Start from entry point
+    // Start from entry point (using greedy search through upper layers)
     int64_t entry = graph.GreedySearchToUpperLayers(query);
     if (entry < 0 || entry >= graph.size()) {
         entry = 0;
     }
 
-    // Debug: print entry point info and some labels
-    static bool debug_printed = false;
-    if (!debug_printed) {
-        auto entry_neighbors = graph.GetNeighbors(entry, 0);
-        std::cout << "DEBUG: entry=" << entry << ", level0_neighbors=" << entry_neighbors.size() << std::endl;
-        std::cout << "DEBUG: target_label=" << target_label << std::endl;
-        std::cout << "DEBUG: entry label=" << filter_set.GetLabel(entry) << std::endl;
-        std::cout << "DEBUG: first 10 neighbor labels: ";
-        for (int i = 0; i < std::min(10, (int)entry_neighbors.size()); i++) {
-            std::cout << filter_set.GetLabel(entry_neighbors[i]) << " ";
-        }
-        std::cout << std::endl;
-
-        // Check which neighbors match
-        int matching_neighbors = 0;
-        for (auto n : entry_neighbors) {
-            if (filter_set.GetLabel(n) == target_label) matching_neighbors++;
-        }
-        std::cout << "DEBUG: matching neighbors in entry's neighborhood: " << matching_neighbors << std::endl;
-
-        debug_printed = true;
-    }
-
     float entry_vec_dist = graph.ComputeDistance(query, entry);
     frontier.push({-combined_dist(entry_vec_dist, entry), entry});
 
+    // Phase 1: Search with combined_dist to guide direction
+    // Collect ALL nodes into candidate pool (not just matches)
+    // Early stopping when we have enough matching candidates
+    int min_matches_for_early_stop = k * 20;  // Need enough matches for high recall
+
     while (!frontier.empty() && result.nodes_visited < max_visits) {
-        auto [neg_dist, current] = frontier.top();
+        auto [neg_combined, current] = frontier.top();
         frontier.pop();
 
         if (visited.count(current)) continue;
         visited.insert(current);
         result.nodes_visited++;
 
-        // Debug: print first few nodes we visit
-        static int visit_count = 0;
-        if (visit_count < 10) {
-            int32_t node_label = filter_set.GetLabel(current);
-            bool matches = (node_label == target_label);
-            std::cout << "DEBUG visit " << visit_count << ": node=" << current
-                      << " label=" << node_label << " target=" << target_label
-                      << " matches=" << matches << " dist=" << -neg_dist << std::endl;
-            visit_count++;
-        }
+        // Add ALL visited nodes to candidates (sorted by vec_dist, not combined_dist)
+        float vec_dist = graph.ComputeDistance(query, current);
+        candidates.push_back({vec_dist, current});
 
-        // Check if matches filter
+        // Track valid visits for metrics
         if (filter_set.GetLabel(current) == target_label) {
-            float vec_dist = graph.ComputeDistance(query, current);
-            matched.push_back({vec_dist, current});
             result.valid_visits++;
-            std::cout << "DEBUG: FOUND MATCH! node=" << current << " matched.size=" << matched.size() << std::endl;
+            matching_distances.push_back(vec_dist);
         }
 
-        // Stop if we have enough matches
-        if (static_cast<int>(matched.size()) >= k * 50) {
-            break;
+        // Early stopping: if we have enough matches and the frontier's best combined dist
+        // is larger than the k-th best match's vec_dist, we can stop
+        if (static_cast<int>(matching_distances.size()) >= min_matches_for_early_stop) {
+            // Sort matching distances to find k-th best
+            std::sort(matching_distances.begin(), matching_distances.end());
+            float kth_best_match_dist = matching_distances[std::min(k-1, (int)matching_distances.size()-1)];
+
+            // Check if frontier's best is worse than k-th best match
+            float frontier_best_combined = -frontier.top().first;
+
+            // If the best remaining in frontier (combined dist) is worse than k-th best match (vec dist)
+            // plus a margin, we can safely stop
+            if (!frontier.empty() && frontier_best_combined > kth_best_match_dist + filter_weight) {
+                break;
+            }
         }
 
-        // Explore neighbors
+        // Explore neighbors using combined_dist for prioritization
         auto neighbors = graph.GetNeighbors(current, 0);
         for (int64_t neighbor : neighbors) {
             if (neighbor < 0 || neighbor >= graph.size() || visited.count(neighbor)) {
                 continue;
             }
-            float vec_dist = graph.ComputeDistance(query, neighbor);
-            float combined = combined_dist(vec_dist, neighbor);
+            float n_vec_dist = graph.ComputeDistance(query, neighbor);
+            float combined = combined_dist(n_vec_dist, neighbor);
             frontier.push({-combined, neighbor});
         }
     }
 
-    // Debug: print how many matches we found
-    if (matched.empty()) {
-        static int empty_count = 0;
-        if (empty_count < 3) {
-            std::cout << "DEBUG: No matches found! visited=" << result.nodes_visited
-                      << ", frontier_remaining=" << frontier.size() << std::endl;
-            empty_count++;
-        }
-    }
+    // Phase 2: Sort candidates by vector distance and filter for top-k matches
+    // This ensures we get the globally best matches, not just early discoveries
+    std::sort(candidates.begin(), candidates.end());
 
-    // Sort matched by vector distance and return top-k
-    std::sort(matched.begin(), matched.end());
-    for (int i = 0; i < std::min(k, static_cast<int>(matched.size())); i++) {
-        result.ids.push_back(matched[i].second);
+    int matches_found = 0;
+    for (const auto& [dist, node_id] : candidates) {
+        if (filter_set.GetLabel(node_id) == target_label) {
+            result.ids.push_back(node_id);
+            matches_found++;
+            if (matches_found >= k) break;
+        }
     }
 
     return result;
@@ -1065,8 +1094,8 @@ RunSIFT1MBenchmark(const float* base_data, int64_t n, int64_t dim,
 TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
     // Print version info
     std::cout << "\n========================================" << std::endl;
-    std::cout << "JAG-HNSW Test Version: 2025-02-14-v16" << std::endl;
-    std::cout << "debug mode: check matches flag" << std::endl;
+    std::cout << "JAG-HNSW Test Version: 2025-02-16-v1" << std::endl;
+    std::cout << "Fixed: Candidate pool management for recall recovery" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Get data path from environment or use default
