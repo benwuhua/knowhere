@@ -169,8 +169,8 @@ L2DistanceSq(const float* a, const float* b, int64_t dim) {
 // Search result
 struct SearchResult {
     std::vector<int64_t> ids;
-    int64_t nodes_visited;
-    int64_t valid_visits;
+    int64_t nodes_visited = 0;
+    int64_t valid_visits = 0;
 };
 
 // Baseline search (post-filter)

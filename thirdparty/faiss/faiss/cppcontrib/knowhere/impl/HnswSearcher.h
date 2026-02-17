@@ -781,28 +781,27 @@ struct v2_hnsw_jag_searcher {
     }
 
     // Search on a level using JAG ranking
-    // Collects all valid candidates for final ranking
-    faiss::HNSWStats search_on_a_level_jag(
+    // Optimized v2: Use retset directly, no separate valid_candidates vector
+    // Key insight: valid_ns_ in NeighborSetDoublePopList stores valid neighbors by actual distance
+    faiss::HNSWStats search_on_a_level_jag_v2(
             knowhere::NeighborSetDoublePopList& retset,
-            std::vector<std::pair<float, storage_idx_t>>& valid_candidates,
             const int level,
+            const idx_t k,
+            float* __restrict distances,
+            idx_t* __restrict labels,
             float initial_accumulated_alpha = 1.0f) {
         faiss::HNSWStats stats;
 
         float accumulated_alpha = initial_accumulated_alpha;
 
-        auto add_search_candidate = [&](const knowhere::Neighbor n) {
-            // Collect valid candidates for final ranking
-            if (n.status == knowhere::Neighbor::kValid) {
-                valid_candidates.push_back({0.0f, n.id});
-            }
+        auto add_search_candidate = [&](const knowhere::Neighbor& n) {
             return retset.insert(n);
         };
 
         while (retset.has_next()) {
             const knowhere::Neighbor neighbor = retset.pop();
 
-            faiss::HNSWStats local_stats = evaluate_single_node_jag(
+            faiss::HNSWStats local_stats = evaluate_single_node_jag_v2(
                     neighbor.id,
                     level,
                     accumulated_alpha,
@@ -811,6 +810,225 @@ struct v2_hnsw_jag_searcher {
             if (track_hnsw_stats) {
                 stats.combine(local_stats);
             }
+        }
+
+        // Extract results directly from retset's valid_ns_
+        // retset already maintains valid neighbors sorted by distance
+        const idx_t len = std::min((idx_t)retset.size(), k);
+        for (idx_t i = 0; i < len; i++) {
+            const auto& nbr = retset[i];
+            distances[i] = nbr.distance;  // Already actual distance
+            labels[i] = nbr.id;
+        }
+
+        // Fill remaining slots
+        for (idx_t i = len; i < k; i++) {
+            labels[i] = -1;
+            distances[i] = std::numeric_limits<float>::max();
+        }
+
+        return stats;
+    }
+
+    // Optimized v2: For valid neighbors, store actual distance
+    // For invalid neighbors, store combined distance (for ranking in invalid_ns_)
+    template <typename FuncAddCandidate>
+    faiss::HNSWStats evaluate_single_node_jag_v2(
+            const idx_t node_id,
+            const int level,
+            float& accumulated_alpha,
+            FuncAddCandidate func_add_candidate) {
+        faiss::HNSWStats stats;
+
+        size_t begin = 0;
+        size_t end = 0;
+        hnsw.neighbor_range(node_id, level, &begin, &end);
+
+        size_t counter = 0;
+        size_t saved_indices[4];
+        bool saved_is_valid[4];  // true = valid, false = invalid
+
+        size_t ndis = 0;
+        for (size_t j = begin; j < end; j++) {
+            const storage_idx_t v1 = hnsw.neighbors[j];
+
+            if (v1 < 0) {
+                break;
+            }
+
+            if (visited_nodes.get(v1)) {
+                graph_visitor.visit_edge(level, node_id, v1, -1);
+                continue;
+            }
+
+            visited_nodes.set(v1);
+
+            bool is_valid = filter.is_member(v1);
+            if (!is_valid) {
+                // Alpha mechanism: probabilistic admission
+                accumulated_alpha += kAlpha;
+                if (accumulated_alpha < 1.0f) {
+                    continue;
+                }
+                accumulated_alpha -= 1.0f;
+            }
+
+            saved_indices[counter] = v1;
+            saved_is_valid[counter] = is_valid;
+            counter += 1;
+            ndis += 1;
+
+            if (counter == 4) {
+                float dis[4] = {0, 0, 0, 0};
+                qdis.distances_batch_4(
+                        saved_indices[0],
+                        saved_indices[1],
+                        saved_indices[2],
+                        saved_indices[3],
+                        dis[0],
+                        dis[1],
+                        dis[2],
+                        dis[3]);
+
+                for (size_t id4 = 0; id4 < 4; id4++) {
+                    graph_visitor.visit_edge(
+                            level, node_id, saved_indices[id4], dis[id4]);
+
+                    if (saved_is_valid[id4]) {
+                        // Valid: store actual distance (sorted in valid_ns_)
+                        knowhere::Neighbor nn(saved_indices[id4], dis[id4], knowhere::Neighbor::kValid);
+                        func_add_candidate(nn);
+                    } else {
+                        // Invalid: store combined distance (for ranking in invalid_ns_)
+                        float combined = compute_combined_dist(dis[id4], true);
+                        knowhere::Neighbor nn(saved_indices[id4], combined, knowhere::Neighbor::kInvalid);
+                        func_add_candidate(nn);
+                    }
+                }
+
+                counter = 0;
+            }
+        }
+
+        // Process leftovers
+        for (size_t id4 = 0; id4 < counter; id4++) {
+            const float dis = qdis(saved_indices[id4]);
+
+            graph_visitor.visit_edge(level, node_id, saved_indices[id4], dis);
+
+            if (saved_is_valid[id4]) {
+                knowhere::Neighbor nn(saved_indices[id4], dis, knowhere::Neighbor::kValid);
+                func_add_candidate(nn);
+            } else {
+                float combined = compute_combined_dist(dis, true);
+                knowhere::Neighbor nn(saved_indices[id4], combined, knowhere::Neighbor::kInvalid);
+                func_add_candidate(nn);
+            }
+        }
+
+        if (track_hnsw_stats) {
+            stats.ndis = ndis;
+            stats.nhops = 1;
+        }
+
+        return stats;
+    }
+
+    // Optimized: evaluate neighbors and add candidates with JAG ranking
+    // Also passes actual distance to callback to avoid recomputation
+    template <typename FuncAddCandidate>
+    faiss::HNSWStats evaluate_single_node_jag_with_actual_dist(
+            const idx_t node_id,
+            const int level,
+            float& accumulated_alpha,
+            FuncAddCandidate func_add_candidate) {
+        faiss::HNSWStats stats;
+
+        size_t begin = 0;
+        size_t end = 0;
+        hnsw.neighbor_range(node_id, level, &begin, &end);
+
+        size_t counter = 0;
+        size_t saved_indices[4];
+        int saved_statuses[4];
+
+        size_t ndis = 0;
+        for (size_t j = begin; j < end; j++) {
+            const storage_idx_t v1 = hnsw.neighbors[j];
+
+            if (v1 < 0) {
+                break;
+            }
+
+            if (visited_nodes.get(v1)) {
+                graph_visitor.visit_edge(level, node_id, v1, -1);
+                continue;
+            }
+
+            visited_nodes.set(v1);
+
+            int status = knowhere::Neighbor::kValid;
+            if (!filter.is_member(v1)) {
+                status = knowhere::Neighbor::kInvalid;
+
+                // Alpha mechanism: probabilistic admission
+                accumulated_alpha += kAlpha;
+                if (accumulated_alpha < 1.0f) {
+                    continue;
+                }
+                accumulated_alpha -= 1.0f;
+            }
+
+            saved_indices[counter] = v1;
+            saved_statuses[counter] = status;
+            counter += 1;
+            ndis += 1;
+
+            if (counter == 4) {
+                float dis[4] = {0, 0, 0, 0};
+                qdis.distances_batch_4(
+                        saved_indices[0],
+                        saved_indices[1],
+                        saved_indices[2],
+                        saved_indices[3],
+                        dis[0],
+                        dis[1],
+                        dis[2],
+                        dis[3]);
+
+                for (size_t id4 = 0; id4 < 4; id4++) {
+                    graph_visitor.visit_edge(
+                            level, node_id, saved_indices[id4], dis[id4]);
+
+                    // JAG: Use combined distance for ranking
+                    bool is_filtered = (saved_statuses[id4] == knowhere::Neighbor::kInvalid);
+                    float combined = compute_combined_dist(dis[id4], is_filtered);
+
+                    // Store combined distance for ranking, pass actual distance to callback
+                    knowhere::Neighbor nn(saved_indices[id4], combined, saved_statuses[id4]);
+                    func_add_candidate(nn, dis[id4]);  // Pass actual distance
+                }
+
+                counter = 0;
+            }
+        }
+
+        // Process leftovers
+        for (size_t id4 = 0; id4 < counter; id4++) {
+            const float dis = qdis(saved_indices[id4]);
+
+            graph_visitor.visit_edge(level, node_id, saved_indices[id4], dis);
+
+            bool is_filtered = (saved_statuses[id4] == knowhere::Neighbor::kInvalid);
+            float combined = compute_combined_dist(dis, is_filtered);
+
+            knowhere::Neighbor nn(saved_indices[id4], combined, saved_statuses[id4]);
+            func_add_candidate(nn, dis);  // Pass actual distance
+        }
+
+        if (track_hnsw_stats) {
+            stats.ndis = ndis;
+            stats.nhops = 1;
         }
 
         return stats;
@@ -867,57 +1085,26 @@ struct v2_hnsw_jag_searcher {
         // level 0 search
         graph_visitor.visit_level(0);
 
-        // For JAG, use the same efSearch as Alpha-only for fair comparison
-        // The benefit of JAG comes from better traversal order, not fewer visits
+        // For JAG v2: Use NeighborSetDoublePopList to directly manage valid/invalid neighbors
         const idx_t n_candidates = std::max((idx_t)efSearch, k);
         knowhere::NeighborSetDoublePopList retset(n_candidates);
 
-        // Collect valid candidates for final ranking
-        std::vector<std::pair<float, storage_idx_t>> valid_candidates;
-        valid_candidates.reserve(n_candidates);
-
         // Initialize retset with entry point
         {
-            bool is_filtered = !filter.is_member(nearest);
-            float combined = compute_combined_dist(d_nearest, is_filtered);
-            int status = is_filtered ? knowhere::Neighbor::kInvalid : knowhere::Neighbor::kValid;
+            bool is_valid = filter.is_member(nearest);
+            float dist_to_store = is_valid ? d_nearest : compute_combined_dist(d_nearest, true);
+            int status = is_valid ? knowhere::Neighbor::kValid : knowhere::Neighbor::kInvalid;
 
-            retset.insert(knowhere::Neighbor(nearest, combined, status));
+            retset.insert(knowhere::Neighbor(nearest, dist_to_store, status));
             visited_nodes[nearest] = true;
-
-            // Add entry point to valid candidates if valid
-            if (status == knowhere::Neighbor::kValid) {
-                valid_candidates.push_back({d_nearest, nearest});
-            }
         }
 
-        // Perform JAG search
-        faiss::HNSWStats local_stats = search_on_a_level_jag(retset, valid_candidates, 0);
+        // Perform JAG search v2 - results extracted directly in the function
+        faiss::HNSWStats local_stats = search_on_a_level_jag_v2(
+                retset, 0, k, distances, labels);
 
         if (track_hnsw_stats) {
             stats.combine(local_stats);
-        }
-
-        // Recompute actual distances for valid candidates
-        // Optimization: Only compute distances we need for final k results
-        for (auto& [dist, id] : valid_candidates) {
-            dist = qdis(id);
-        }
-
-        // Sort valid candidates by actual distance
-        std::sort(valid_candidates.begin(), valid_candidates.end());
-
-        // Populate results
-        const idx_t len = std::min((idx_t)valid_candidates.size(), k);
-        for (idx_t i = 0; i < len; i++) {
-            distances[i] = valid_candidates[i].first;
-            labels[i] = valid_candidates[i].second;
-        }
-
-        // Fill remaining slots
-        for (idx_t i = len; i < k; i++) {
-            labels[i] = -1;
-            distances[i] = std::numeric_limits<float>::max();
         }
 
         return stats;
