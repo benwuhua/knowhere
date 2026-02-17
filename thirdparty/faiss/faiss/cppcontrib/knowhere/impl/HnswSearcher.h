@@ -794,7 +794,6 @@ struct v2_hnsw_jag_searcher {
         auto add_search_candidate = [&](const knowhere::Neighbor n) {
             // Collect valid candidates for final ranking
             if (n.status == knowhere::Neighbor::kValid) {
-                // Store with placeholder distance (will be recomputed later)
                 valid_candidates.push_back({0.0f, n.id});
             }
             return retset.insert(n);
@@ -868,8 +867,9 @@ struct v2_hnsw_jag_searcher {
         // level 0 search
         graph_visitor.visit_level(0);
 
-        // Use larger candidate set for JAG (need more candidates for filtering)
-        const idx_t n_candidates = std::max((idx_t)efSearch * 2, k * 4);
+        // For JAG, use the same efSearch as Alpha-only for fair comparison
+        // The benefit of JAG comes from better traversal order, not fewer visits
+        const idx_t n_candidates = std::max((idx_t)efSearch, k);
         knowhere::NeighborSetDoublePopList retset(n_candidates);
 
         // Collect valid candidates for final ranking
@@ -899,6 +899,7 @@ struct v2_hnsw_jag_searcher {
         }
 
         // Recompute actual distances for valid candidates
+        // Optimization: Only compute distances we need for final k results
         for (auto& [dist, id] : valid_candidates) {
             dist = qdis(id);
         }
