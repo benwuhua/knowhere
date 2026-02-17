@@ -563,10 +563,10 @@ struct v2_hnsw_searcher {
     }
 };
 
-// JAG-HNSW Searcher: Combines JAG (filter-guided traversal) with Alpha (probabilistic admission)
-// Phase 1: Use combined_dist (vec_dist + filter_weight * filter_dist) for frontier sorting
-//          Apply Alpha mechanism for filtered nodes to maintain graph connectivity
-// Phase 2: Sort candidates by vec_dist and filter for top-k matches
+// Optimized JAG-HNSW Searcher: Uses combined distance for ranking while
+// maintaining compatibility with efficient NeighborSetDoublePopList
+// Key optimization: Store combined_dist in Neighbor.distance for ranking,
+//                  collect all candidates, then filter and sort by actual distance
 template <
         typename DistanceComputerT,
         typename GraphVisitorT,
@@ -596,7 +596,6 @@ struct v2_hnsw_jag_searcher {
 
     // JAG parameters
     const float filter_weight;          // Weight for filter distance in combined score
-    const int candidate_pool_size;      // Size of candidate pool for final ranking
 
     // custom parameters of HNSW search.
     const faiss::SearchParametersHNSW* params;
@@ -610,7 +609,7 @@ struct v2_hnsw_jag_searcher {
             const FilterT& filter_,
             const float kAlpha_,
             const float filter_weight_,
-            const int candidate_pool_size_,
+            const int /*candidate_pool_size_*/,  // Not used in optimized version
             const faiss::SearchParametersHNSW* params_)
             : hnsw{hnsw_},
               qdis{qdis_},
@@ -619,7 +618,6 @@ struct v2_hnsw_jag_searcher {
               filter{filter_},
               kAlpha{kAlpha_},
               filter_weight{filter_weight_},
-              candidate_pool_size{candidate_pool_size_},
               params{params_} {}
 
     v2_hnsw_jag_searcher(const v2_hnsw_jag_searcher&) = delete;
@@ -628,8 +626,6 @@ struct v2_hnsw_jag_searcher {
     v2_hnsw_jag_searcher& operator=(v2_hnsw_jag_searcher&&) = delete;
 
     // Compute combined distance for JAG ranking
-    // combined_dist = vec_dist + filter_weight * filter_dist
-    // filter_dist = 0 if node matches filter, 1 otherwise
     inline float
     compute_combined_dist(float vec_dist, bool is_filtered) const {
         return vec_dist + filter_weight * (is_filtered ? 1.0f : 0.0f);
@@ -682,163 +678,140 @@ struct v2_hnsw_jag_searcher {
         }
     }
 
-    // Candidate for JAG search with candidate pool management
-    struct JagCandidate {
-        storage_idx_t id;
-        float vec_dist;
-        bool is_filtered;
-        float combined_dist;
-
-        // For min-heap by combined distance
-        bool operator<(const JagCandidate& other) const {
-            return combined_dist > other.combined_dist;
-        }
-    };
-
-    // JAG search on level 0 with combined Alpha mechanism and candidate pool
-    faiss::HNSWStats search_on_level_jag(
-            const idx_t k,
-            float* __restrict distances,
-            idx_t* __restrict labels) {
+    // Optimized: evaluate neighbors and add candidates with JAG ranking
+    // Stores combined_dist in Neighbor.distance for efficient ranking
+    template <typename FuncAddCandidate>
+    faiss::HNSWStats evaluate_single_node_jag(
+            const idx_t node_id,
+            const int level,
+            float& accumulated_alpha,
+            FuncAddCandidate func_add_candidate) {
         faiss::HNSWStats stats;
 
-        const int efSearch = params ? params->efSearch : hnsw.efSearch;
-        const int pool_size = (candidate_pool_size > 0) ? candidate_pool_size : efSearch * 4;
+        size_t begin = 0;
+        size_t end = 0;
+        hnsw.neighbor_range(node_id, level, &begin, &end);
 
-        // Priority queue for frontier (sorted by combined_dist)
-        std::priority_queue<JagCandidate> frontier;
+        size_t counter = 0;
+        size_t saved_indices[4];
+        int saved_statuses[4];
+        float saved_distances[4];  // Store actual distances
 
-        // Candidate pool for final ranking (stores all visited nodes)
-        std::vector<JagCandidate> candidate_pool;
-        candidate_pool.reserve(pool_size);
+        size_t ndis = 0;
+        for (size_t j = begin; j < end; j++) {
+            const storage_idx_t v1 = hnsw.neighbors[j];
 
-        // Alpha accumulator for probabilistic filtered node admission
-        float accumulated_alpha = 1.0f;
-
-        // Initialize with entry point
-        {
-            storage_idx_t nearest = hnsw.entry_point;
-            if (nearest < 0) {
-                return stats;
+            if (v1 < 0) {
+                break;
             }
 
-            float d_nearest = qdis(nearest);
-            bool is_filtered = !filter.is_member(nearest);
-            float combined = compute_combined_dist(d_nearest, is_filtered);
+            if (visited_nodes.get(v1)) {
+                graph_visitor.visit_edge(level, node_id, v1, -1);
+                continue;
+            }
 
-            frontier.push({nearest, d_nearest, is_filtered, combined});
-            visited_nodes[nearest] = true;
+            visited_nodes.set(v1);
 
-            // Add to candidate pool
-            candidate_pool.push_back({nearest, d_nearest, is_filtered, combined});
-        }
+            int status = knowhere::Neighbor::kValid;
+            if (!filter.is_member(v1)) {
+                status = knowhere::Neighbor::kInvalid;
 
-        // Main search loop with JAG ranking and Alpha admission
-        while (!frontier.empty()) {
-            JagCandidate current = frontier.top();
-            frontier.pop();
-
-            // Process neighbors
-            size_t begin = 0;
-            size_t end = 0;
-            hnsw.neighbor_range(current.id, 0, &begin, &end);
-
-            for (size_t j = begin; j < end; j++) {
-                const storage_idx_t v1 = hnsw.neighbors[j];
-
-                if (v1 < 0) {
-                    break;
-                }
-
-                if (visited_nodes.get(v1)) {
-                    graph_visitor.visit_edge(0, current.id, v1, -1);
+                // Alpha mechanism: probabilistic admission
+                accumulated_alpha += kAlpha;
+                if (accumulated_alpha < 1.0f) {
                     continue;
                 }
-
-                // Mark as visited
-                visited_nodes.set(v1);
-
-                // Check filter status
-                bool is_filtered = !filter.is_member(v1);
-
-                // Alpha mechanism: probabilistic admission for filtered nodes
-                if (is_filtered) {
-                    accumulated_alpha += kAlpha;
-                    if (accumulated_alpha < 1.0f) {
-                        // Skip this filtered node (but still add to candidate pool)
-                        // This maintains graph connectivity while prioritizing valid nodes
-                    }
-                    // Allow this node to be added to frontier
-                    accumulated_alpha -= 1.0f;
-                }
-
-                // Compute distance
-                const float dis = qdis(v1);
-                float combined = compute_combined_dist(dis, is_filtered);
-
-                graph_visitor.visit_edge(0, current.id, v1, dis);
-
-                // Add to candidate pool (all nodes, for final ranking)
-                candidate_pool.push_back({v1, dis, is_filtered, combined});
-
-                // Add to frontier (JAG ranking by combined_dist)
-                frontier.push({v1, dis, is_filtered, combined});
-
-                if (track_hnsw_stats) {
-                    stats.ndis += 1;
-                }
-
-                // Early termination if candidate pool is full and frontier is exhausted
-                // or if we've visited enough nodes
-                if (static_cast<int>(candidate_pool.size()) >= pool_size) {
-                    // Check if frontier's best combined_dist is worse than
-                    // the k-th best vec_dist among valid candidates
-                    int valid_count = 0;
-                    float kth_valid_dist = std::numeric_limits<float>::max();
-                    for (const auto& c : candidate_pool) {
-                        if (!c.is_filtered) {
-                            valid_count++;
-                            if (valid_count >= k) {
-                                kth_valid_dist = c.vec_dist;
-                                break;
-                            }
-                        }
-                    }
-                    // If frontier is exhausted or best combined > kth valid + margin
-                    if (frontier.empty() ||
-                        (!frontier.empty() && frontier.top().combined_dist > kth_valid_dist + filter_weight)) {
-                        break;
-                    }
-                }
+                accumulated_alpha -= 1.0f;
             }
 
-            stats.nhops += 1;
-        }
+            saved_indices[counter] = v1;
+            saved_statuses[counter] = status;
+            counter += 1;
+            ndis += 1;
 
-        // Phase 2: Sort candidates by vector distance (not combined distance)
-        // and select top-k valid (non-filtered) nodes
-        std::sort(candidate_pool.begin(), candidate_pool.end(),
-                  [](const JagCandidate& a, const JagCandidate& b) {
-                      return a.vec_dist < b.vec_dist;
-                  });
+            if (counter == 4) {
+                float dis[4] = {0, 0, 0, 0};
+                qdis.distances_batch_4(
+                        saved_indices[0],
+                        saved_indices[1],
+                        saved_indices[2],
+                        saved_indices[3],
+                        dis[0],
+                        dis[1],
+                        dis[2],
+                        dis[3]);
 
-        // Select top-k valid candidates
-        idx_t result_count = 0;
-        for (const auto& candidate : candidate_pool) {
-            if (!candidate.is_filtered) {
-                distances[result_count] = candidate.vec_dist;
-                labels[result_count] = candidate.id;
-                result_count++;
-                if (result_count >= k) {
-                    break;
+                for (size_t id4 = 0; id4 < 4; id4++) {
+                    graph_visitor.visit_edge(
+                            level, node_id, saved_indices[id4], dis[id4]);
+
+                    // JAG: Use combined distance for ranking
+                    bool is_filtered = (saved_statuses[id4] == knowhere::Neighbor::kInvalid);
+                    float combined = compute_combined_dist(dis[id4], is_filtered);
+
+                    // Store combined distance in distance field for ranking
+                    knowhere::Neighbor nn(saved_indices[id4], combined, saved_statuses[id4]);
+                    // Store actual distance in a separate structure or recover later
+                    func_add_candidate(nn);
                 }
+
+                counter = 0;
             }
         }
 
-        // Fill remaining slots if not enough valid candidates
-        for (idx_t i = result_count; i < k; i++) {
-            labels[i] = -1;
-            distances[i] = std::numeric_limits<float>::max();
+        // Process leftovers
+        for (size_t id4 = 0; id4 < counter; id4++) {
+            const float dis = qdis(saved_indices[id4]);
+
+            graph_visitor.visit_edge(level, node_id, saved_indices[id4], dis);
+
+            bool is_filtered = (saved_statuses[id4] == knowhere::Neighbor::kInvalid);
+            float combined = compute_combined_dist(dis, is_filtered);
+
+            knowhere::Neighbor nn(saved_indices[id4], combined, saved_statuses[id4]);
+            func_add_candidate(nn);
+        }
+
+        if (track_hnsw_stats) {
+            stats.ndis = ndis;
+            stats.nhops = 1;
+        }
+
+        return stats;
+    }
+
+    // Search on a level using JAG ranking
+    // Collects all valid candidates for final ranking
+    faiss::HNSWStats search_on_a_level_jag(
+            knowhere::NeighborSetDoublePopList& retset,
+            std::vector<std::pair<float, storage_idx_t>>& valid_candidates,
+            const int level,
+            float initial_accumulated_alpha = 1.0f) {
+        faiss::HNSWStats stats;
+
+        float accumulated_alpha = initial_accumulated_alpha;
+
+        auto add_search_candidate = [&](const knowhere::Neighbor n) {
+            // Collect valid candidates for final ranking
+            if (n.status == knowhere::Neighbor::kValid) {
+                // Store with placeholder distance (will be recomputed later)
+                valid_candidates.push_back({0.0f, n.id});
+            }
+            return retset.insert(n);
+        };
+
+        while (retset.has_next()) {
+            const knowhere::Neighbor neighbor = retset.pop();
+
+            faiss::HNSWStats local_stats = evaluate_single_node_jag(
+                    neighbor.id,
+                    level,
+                    accumulated_alpha,
+                    add_search_candidate);
+
+            if (track_hnsw_stats) {
+                stats.combine(local_stats);
+            }
         }
 
         return stats;
@@ -875,6 +848,8 @@ struct v2_hnsw_jag_searcher {
             return stats;
         }
 
+        const int efSearch = params ? params->efSearch : hnsw.efSearch;
+
         if (hnsw.upper_beam != 1) {
             FAISS_THROW_MSG("Not implemented");
             return stats;
@@ -890,13 +865,58 @@ struct v2_hnsw_jag_searcher {
             stats.combine(bottom_levels_stats);
         }
 
-        // level 0 search with JAG
+        // level 0 search
         graph_visitor.visit_level(0);
 
-        faiss::HNSWStats local_stats = search_on_level_jag(k, distances, labels);
+        // Use larger candidate set for JAG (need more candidates for filtering)
+        const idx_t n_candidates = std::max((idx_t)efSearch * 2, k * 4);
+        knowhere::NeighborSetDoublePopList retset(n_candidates);
+
+        // Collect valid candidates for final ranking
+        std::vector<std::pair<float, storage_idx_t>> valid_candidates;
+        valid_candidates.reserve(n_candidates);
+
+        // Initialize retset with entry point
+        {
+            bool is_filtered = !filter.is_member(nearest);
+            float combined = compute_combined_dist(d_nearest, is_filtered);
+            int status = is_filtered ? knowhere::Neighbor::kInvalid : knowhere::Neighbor::kValid;
+
+            retset.insert(knowhere::Neighbor(nearest, combined, status));
+            visited_nodes[nearest] = true;
+
+            // Add entry point to valid candidates if valid
+            if (status == knowhere::Neighbor::kValid) {
+                valid_candidates.push_back({d_nearest, nearest});
+            }
+        }
+
+        // Perform JAG search
+        faiss::HNSWStats local_stats = search_on_a_level_jag(retset, valid_candidates, 0);
 
         if (track_hnsw_stats) {
             stats.combine(local_stats);
+        }
+
+        // Recompute actual distances for valid candidates
+        for (auto& [dist, id] : valid_candidates) {
+            dist = qdis(id);
+        }
+
+        // Sort valid candidates by actual distance
+        std::sort(valid_candidates.begin(), valid_candidates.end());
+
+        // Populate results
+        const idx_t len = std::min((idx_t)valid_candidates.size(), k);
+        for (idx_t i = 0; i < len; i++) {
+            distances[i] = valid_candidates[i].first;
+            labels[i] = valid_candidates[i].second;
+        }
+
+        // Fill remaining slots
+        for (idx_t i = len; i < k; i++) {
+            labels[i] = -1;
+            distances[i] = std::numeric_limits<float>::max();
         }
 
         return stats;
