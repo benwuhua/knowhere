@@ -1359,6 +1359,11 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
         // set up kAlpha
         hnsw_search_params.kAlpha = bitset.filter_ratio() * 0.7f;
 
+        // set up JAG parameters
+        hnsw_search_params.enable_jag = hnsw_cfg.enable_jag.value();
+        hnsw_search_params.jag_filter_weight = hnsw_cfg.jag_filter_weight.value();
+        hnsw_search_params.jag_candidate_pool_size = hnsw_cfg.jag_candidate_pool_size.value();
+
         // set up a selector
         BitsetViewIDSelector bw_idselector(bitset);
         faiss::IDSelector* id_selector = &bw_idselector;
@@ -1651,6 +1656,11 @@ class BaseFaissRegularIndexHNSWNode : public BaseFaissRegularIndexNode {
         hnsw_search_params.feder = feder_result.get();
         // set up kAlpha
         hnsw_search_params.kAlpha = bitset.filter_ratio() * 0.7f;
+
+        // set up JAG parameters
+        hnsw_search_params.enable_jag = hnsw_cfg.enable_jag.value();
+        hnsw_search_params.jag_filter_weight = hnsw_cfg.jag_filter_weight.value();
+        hnsw_search_params.jag_candidate_pool_size = hnsw_cfg.jag_candidate_pool_size.value();
 
         // set up a selector
         BitsetViewIDSelector bw_idselector(bitset);

@@ -94,11 +94,18 @@ IndexHNSWWrapper::search(idx_t n, const float* __restrict x, idx_t k, float* __r
     const faiss::HNSW& hnsw = index_hnsw->hnsw;
 
     float kAlpha = 0.0f;
+    bool enable_jag = false;
+    float jag_filter_weight = 1.0f;
+    int jag_candidate_pool_size = 0;
+
     if (params_in) {
         params = dynamic_cast<const SearchParametersHNSWWrapper*>(params_in);
         FAISS_THROW_IF_NOT_MSG(params, "params type invalid");
 
         kAlpha = params->kAlpha;
+        enable_jag = params->enable_jag;
+        jag_filter_weight = params->jag_filter_weight;
+        jag_candidate_pool_size = params->jag_candidate_pool_size;
     }
 
     // set up hnsw_stats
@@ -140,33 +147,66 @@ IndexHNSWWrapper::search(idx_t n, const float* __restrict x, idx_t k, float* __r
             bw_idselector && !bw_idselector->bitset_view.empty()) {
             // with filter, no mapping
 
-            // feder templating is important, bcz it removes an unneeded 'CALL' instruction.
-            if (feder == nullptr) {
-                // no feder
-                DummyVisitor graph_visitor;
+            // Check if JAG is enabled
+            if (enable_jag) {
+                // Use JAG searcher (filter-guided traversal with candidate pool)
+                if (feder == nullptr) {
+                    DummyVisitor graph_visitor;
 
-                using searcher_type =
-                    faiss::cppcontrib::knowhere::v2_hnsw_searcher<faiss::DistanceComputer, DummyVisitor,
-                                                                  faiss::cppcontrib::knowhere::Bitset,
-                                                                  knowhere::BitsetViewIDSelector>;
+                    using jag_searcher_type =
+                        faiss::cppcontrib::knowhere::v2_hnsw_jag_searcher<faiss::DistanceComputer, DummyVisitor,
+                                                                          faiss::cppcontrib::knowhere::Bitset,
+                                                                          knowhere::BitsetViewIDSelector>;
 
-                searcher_type searcher{hnsw,           *(dis.get()), graph_visitor, bitset_visited_nodes,
-                                       *bw_idselector, kAlpha,       params};
+                    jag_searcher_type searcher{hnsw,           *(dis.get()), graph_visitor, bitset_visited_nodes,
+                                               *bw_idselector, kAlpha,       jag_filter_weight,
+                                               jag_candidate_pool_size, params};
 
-                local_stats = searcher.search(k, distances + i * k, labels + i * k);
+                    local_stats = searcher.search(k, distances + i * k, labels + i * k);
+                } else {
+                    FederVisitor graph_visitor(feder);
+
+                    using jag_searcher_type =
+                        faiss::cppcontrib::knowhere::v2_hnsw_jag_searcher<faiss::DistanceComputer, FederVisitor,
+                                                                          faiss::cppcontrib::knowhere::Bitset,
+                                                                          knowhere::BitsetViewIDSelector>;
+
+                    jag_searcher_type searcher{hnsw,           *(dis.get()), graph_visitor, bitset_visited_nodes,
+                                               *bw_idselector, kAlpha,       jag_filter_weight,
+                                               jag_candidate_pool_size, params};
+
+                    local_stats = searcher.search(k, distances + i * k, labels + i * k);
+                }
             } else {
-                // use feder
-                FederVisitor graph_visitor(feder);
+                // Use standard Alpha-based searcher
+                // feder templating is important, bcz it removes an unneeded 'CALL' instruction.
+                if (feder == nullptr) {
+                    // no feder
+                    DummyVisitor graph_visitor;
 
-                using searcher_type =
-                    faiss::cppcontrib::knowhere::v2_hnsw_searcher<faiss::DistanceComputer, FederVisitor,
-                                                                  faiss::cppcontrib::knowhere::Bitset,
-                                                                  knowhere::BitsetViewIDSelector>;
+                    using searcher_type =
+                        faiss::cppcontrib::knowhere::v2_hnsw_searcher<faiss::DistanceComputer, DummyVisitor,
+                                                                      faiss::cppcontrib::knowhere::Bitset,
+                                                                      knowhere::BitsetViewIDSelector>;
 
-                searcher_type searcher{hnsw,           *(dis.get()), graph_visitor, bitset_visited_nodes,
-                                       *bw_idselector, kAlpha,       params};
+                    searcher_type searcher{hnsw,           *(dis.get()), graph_visitor, bitset_visited_nodes,
+                                           *bw_idselector, kAlpha,       params};
 
-                local_stats = searcher.search(k, distances + i * k, labels + i * k);
+                    local_stats = searcher.search(k, distances + i * k, labels + i * k);
+                } else {
+                    // use feder
+                    FederVisitor graph_visitor(feder);
+
+                    using searcher_type =
+                        faiss::cppcontrib::knowhere::v2_hnsw_searcher<faiss::DistanceComputer, FederVisitor,
+                                                                      faiss::cppcontrib::knowhere::Bitset,
+                                                                      knowhere::BitsetViewIDSelector>;
+
+                    searcher_type searcher{hnsw,           *(dis.get()), graph_visitor, bitset_visited_nodes,
+                                           *bw_idselector, kAlpha,       params};
+
+                    local_stats = searcher.search(k, distances + i * k, labels + i * k);
+                }
             }
         } else {
             // no filter
@@ -245,12 +285,25 @@ IndexHNSWWrapper::range_search(idx_t n, const float* __restrict x, float radius_
     const faiss::HNSW& hnsw = index_hnsw->hnsw;
 
     float kAlpha = 0.0f;
+    bool enable_jag = false;  // JAG is primarily for k-NN search, not range search
+    float jag_filter_weight = 1.0f;
+    int jag_candidate_pool_size = 0;
+
     if (params_in) {
         params = dynamic_cast<const SearchParametersHNSWWrapper*>(params_in);
         FAISS_THROW_IF_NOT_MSG(params, "params type invalid");
 
         kAlpha = params->kAlpha;
+        enable_jag = params->enable_jag;
+        jag_filter_weight = params->jag_filter_weight;
+        jag_candidate_pool_size = params->jag_candidate_pool_size;
     }
+
+    // Note: JAG searcher is not used for range_search, as it's designed for k-NN search
+    // with candidate pool management. Range search uses the standard Alpha mechanism.
+    (void)enable_jag;  // Suppress unused variable warning
+    (void)jag_filter_weight;
+    (void)jag_candidate_pool_size;
 
     // set up hnsw_stats
     faiss::HNSWStats* __restrict const hnsw_stats = (params == nullptr) ? nullptr : params->hnsw_stats;

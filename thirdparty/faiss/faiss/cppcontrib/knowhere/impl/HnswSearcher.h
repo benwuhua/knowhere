@@ -563,6 +563,346 @@ struct v2_hnsw_searcher {
     }
 };
 
+// JAG-HNSW Searcher: Combines JAG (filter-guided traversal) with Alpha (probabilistic admission)
+// Phase 1: Use combined_dist (vec_dist + filter_weight * filter_dist) for frontier sorting
+//          Apply Alpha mechanism for filtered nodes to maintain graph connectivity
+// Phase 2: Sort candidates by vec_dist and filter for top-k matches
+template <
+        typename DistanceComputerT,
+        typename GraphVisitorT,
+        typename VisitedT,
+        typename FilterT>
+struct v2_hnsw_jag_searcher {
+    using storage_idx_t = faiss::HNSW::storage_idx_t;
+    using idx_t = faiss::idx_t;
+
+    // hnsw structure.
+    const faiss::HNSW& hnsw;
+
+    // computes distances.
+    DistanceComputerT& qdis;
+
+    // records visited edges.
+    GraphVisitorT& graph_visitor;
+
+    // tracks visited nodes.
+    VisitedT& visited_nodes;
+
+    // filter for disabled nodes.
+    const FilterT& filter;
+
+    // Alpha parameter for probabilistic filtered node admission
+    const float kAlpha;
+
+    // JAG parameters
+    const float filter_weight;          // Weight for filter distance in combined score
+    const int candidate_pool_size;      // Size of candidate pool for final ranking
+
+    // custom parameters of HNSW search.
+    const faiss::SearchParametersHNSW* params;
+
+    //
+    v2_hnsw_jag_searcher(
+            const faiss::HNSW& hnsw_,
+            DistanceComputerT& qdis_,
+            GraphVisitorT& graph_visitor_,
+            VisitedT& visited_nodes_,
+            const FilterT& filter_,
+            const float kAlpha_,
+            const float filter_weight_,
+            const int candidate_pool_size_,
+            const faiss::SearchParametersHNSW* params_)
+            : hnsw{hnsw_},
+              qdis{qdis_},
+              graph_visitor{graph_visitor_},
+              visited_nodes{visited_nodes_},
+              filter{filter_},
+              kAlpha{kAlpha_},
+              filter_weight{filter_weight_},
+              candidate_pool_size{candidate_pool_size_},
+              params{params_} {}
+
+    v2_hnsw_jag_searcher(const v2_hnsw_jag_searcher&) = delete;
+    v2_hnsw_jag_searcher(v2_hnsw_jag_searcher&&) = delete;
+    v2_hnsw_jag_searcher& operator=(const v2_hnsw_jag_searcher&) = delete;
+    v2_hnsw_jag_searcher& operator=(v2_hnsw_jag_searcher&&) = delete;
+
+    // Compute combined distance for JAG ranking
+    // combined_dist = vec_dist + filter_weight * filter_dist
+    // filter_dist = 0 if node matches filter, 1 otherwise
+    inline float
+    compute_combined_dist(float vec_dist, bool is_filtered) const {
+        return vec_dist + filter_weight * (is_filtered ? 1.0f : 0.0f);
+    }
+
+    // greedily update a nearest vector at a given level.
+    faiss::HNSWStats greedy_update_nearest(
+            const int level,
+            storage_idx_t& nearest,
+            float& d_nearest) {
+        faiss::HNSWStats stats;
+
+        for (;;) {
+            storage_idx_t prev_nearest = nearest;
+
+            size_t begin = 0;
+            size_t end = 0;
+            hnsw.neighbor_range(nearest, level, &begin, &end);
+
+            size_t count = 0;
+            for (size_t i = begin; i < end; i++) {
+                storage_idx_t v = hnsw.neighbors[i];
+                if (v < 0) {
+                    break;
+                }
+                count += 1;
+            }
+
+            for (size_t i = begin; i < begin + count; i++) {
+                storage_idx_t v = hnsw.neighbors[i];
+
+                const float dis = qdis(v);
+
+                graph_visitor.visit_edge(level, prev_nearest, nearest, dis);
+
+                if (dis < d_nearest) {
+                    nearest = v;
+                    d_nearest = dis;
+                }
+            }
+
+            if (track_hnsw_stats) {
+                stats.ndis += count;
+                stats.nhops += 1;
+            }
+
+            if (nearest == prev_nearest) {
+                return stats;
+            }
+        }
+    }
+
+    // Candidate for JAG search with candidate pool management
+    struct JagCandidate {
+        storage_idx_t id;
+        float vec_dist;
+        bool is_filtered;
+        float combined_dist;
+
+        // For min-heap by combined distance
+        bool operator<(const JagCandidate& other) const {
+            return combined_dist > other.combined_dist;
+        }
+    };
+
+    // JAG search on level 0 with combined Alpha mechanism and candidate pool
+    faiss::HNSWStats search_on_level_jag(
+            const idx_t k,
+            float* __restrict distances,
+            idx_t* __restrict labels) {
+        faiss::HNSWStats stats;
+
+        const int efSearch = params ? params->efSearch : hnsw.efSearch;
+        const int pool_size = (candidate_pool_size > 0) ? candidate_pool_size : efSearch * 4;
+
+        // Priority queue for frontier (sorted by combined_dist)
+        std::priority_queue<JagCandidate> frontier;
+
+        // Candidate pool for final ranking (stores all visited nodes)
+        std::vector<JagCandidate> candidate_pool;
+        candidate_pool.reserve(pool_size);
+
+        // Alpha accumulator for probabilistic filtered node admission
+        float accumulated_alpha = 1.0f;
+
+        // Initialize with entry point
+        {
+            storage_idx_t nearest = hnsw.entry_point;
+            if (nearest < 0) {
+                return stats;
+            }
+
+            float d_nearest = qdis(nearest);
+            bool is_filtered = !filter.is_member(nearest);
+            float combined = compute_combined_dist(d_nearest, is_filtered);
+
+            frontier.push({nearest, d_nearest, is_filtered, combined});
+            visited_nodes[nearest] = true;
+
+            // Add to candidate pool
+            candidate_pool.push_back({nearest, d_nearest, is_filtered, combined});
+        }
+
+        // Main search loop with JAG ranking and Alpha admission
+        while (!frontier.empty()) {
+            JagCandidate current = frontier.top();
+            frontier.pop();
+
+            // Process neighbors
+            size_t begin = 0;
+            size_t end = 0;
+            hnsw.neighbor_range(current.id, 0, &begin, &end);
+
+            for (size_t j = begin; j < end; j++) {
+                const storage_idx_t v1 = hnsw.neighbors[j];
+
+                if (v1 < 0) {
+                    break;
+                }
+
+                if (visited_nodes.get(v1)) {
+                    graph_visitor.visit_edge(0, current.id, v1, -1);
+                    continue;
+                }
+
+                // Mark as visited
+                visited_nodes.set(v1);
+
+                // Check filter status
+                bool is_filtered = !filter.is_member(v1);
+
+                // Alpha mechanism: probabilistic admission for filtered nodes
+                if (is_filtered) {
+                    accumulated_alpha += kAlpha;
+                    if (accumulated_alpha < 1.0f) {
+                        // Skip this filtered node (but still add to candidate pool)
+                        // This maintains graph connectivity while prioritizing valid nodes
+                    }
+                    // Allow this node to be added to frontier
+                    accumulated_alpha -= 1.0f;
+                }
+
+                // Compute distance
+                const float dis = qdis(v1);
+                float combined = compute_combined_dist(dis, is_filtered);
+
+                graph_visitor.visit_edge(0, current.id, v1, dis);
+
+                // Add to candidate pool (all nodes, for final ranking)
+                candidate_pool.push_back({v1, dis, is_filtered, combined});
+
+                // Add to frontier (JAG ranking by combined_dist)
+                frontier.push({v1, dis, is_filtered, combined});
+
+                if (track_hnsw_stats) {
+                    stats.ndis += 1;
+                }
+
+                // Early termination if candidate pool is full and frontier is exhausted
+                // or if we've visited enough nodes
+                if (static_cast<int>(candidate_pool.size()) >= pool_size) {
+                    // Check if frontier's best combined_dist is worse than
+                    // the k-th best vec_dist among valid candidates
+                    int valid_count = 0;
+                    float kth_valid_dist = std::numeric_limits<float>::max();
+                    for (const auto& c : candidate_pool) {
+                        if (!c.is_filtered) {
+                            valid_count++;
+                            if (valid_count >= k) {
+                                kth_valid_dist = c.vec_dist;
+                                break;
+                            }
+                        }
+                    }
+                    // If frontier is exhausted or best combined > kth valid + margin
+                    if (frontier.empty() ||
+                        (!frontier.empty() && frontier.top().combined_dist > kth_valid_dist + filter_weight)) {
+                        break;
+                    }
+                }
+            }
+
+            stats.nhops += 1;
+        }
+
+        // Phase 2: Sort candidates by vector distance (not combined distance)
+        // and select top-k valid (non-filtered) nodes
+        std::sort(candidate_pool.begin(), candidate_pool.end(),
+                  [](const JagCandidate& a, const JagCandidate& b) {
+                      return a.vec_dist < b.vec_dist;
+                  });
+
+        // Select top-k valid candidates
+        idx_t result_count = 0;
+        for (const auto& candidate : candidate_pool) {
+            if (!candidate.is_filtered) {
+                distances[result_count] = candidate.vec_dist;
+                labels[result_count] = candidate.id;
+                result_count++;
+                if (result_count >= k) {
+                    break;
+                }
+            }
+        }
+
+        // Fill remaining slots if not enough valid candidates
+        for (idx_t i = result_count; i < k; i++) {
+            labels[i] = -1;
+            distances[i] = std::numeric_limits<float>::max();
+        }
+
+        return stats;
+    }
+
+    // traverse down to the level 0
+    faiss::HNSWStats greedy_search_top_levels(
+            storage_idx_t& nearest,
+            float& d_nearest) {
+        faiss::HNSWStats stats;
+
+        for (int level = hnsw.max_level; level >= 1; level--) {
+            graph_visitor.visit_level(level);
+
+            faiss::HNSWStats local_stats =
+                    greedy_update_nearest(level, nearest, d_nearest);
+
+            if (track_hnsw_stats) {
+                stats.combine(local_stats);
+            }
+        }
+
+        return stats;
+    }
+
+    // perform the search.
+    faiss::HNSWStats search(
+            const idx_t k,
+            float* __restrict distances,
+            idx_t* __restrict labels) {
+        faiss::HNSWStats stats;
+
+        if (hnsw.entry_point == -1) {
+            return stats;
+        }
+
+        if (hnsw.upper_beam != 1) {
+            FAISS_THROW_MSG("Not implemented");
+            return stats;
+        }
+
+        // greedy search on upper levels.
+        storage_idx_t nearest = hnsw.entry_point;
+        float d_nearest = qdis(nearest);
+
+        auto bottom_levels_stats = greedy_search_top_levels(nearest, d_nearest);
+
+        if (track_hnsw_stats) {
+            stats.combine(bottom_levels_stats);
+        }
+
+        // level 0 search with JAG
+        graph_visitor.visit_level(0);
+
+        faiss::HNSWStats local_stats = search_on_level_jag(k, distances, labels);
+
+        if (track_hnsw_stats) {
+            stats.combine(local_stats);
+        }
+
+        return stats;
+    }
+};
+
 } // namespace knowhere
 } // namespace cppcontrib
 } // namespace faiss

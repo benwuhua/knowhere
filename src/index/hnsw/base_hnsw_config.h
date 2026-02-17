@@ -33,6 +33,12 @@ class BaseHnswConfig : public BaseConfig {
     CFG_INT overview_levels;
     CFG_BOOL disable_fallback_brute_force;  // default is false, means we will use fallback brute force when hnsw search
                                             // does not get enough topk results
+
+    // JAG-HNSW parameters (filter-guided graph traversal)
+    CFG_BOOL enable_jag;                     // Enable JAG search strategy
+    CFG_FLOAT jag_filter_weight;             // Weight for filter distance in combined score
+    CFG_INT jag_candidate_pool_size;         // Size of candidate pool (0 = auto)
+
     KNOHWERE_DECLARE_CONFIG(BaseHnswConfig) {
         KNOWHERE_CONFIG_DECLARE_FIELD(M).description("hnsw M").set_default(30).set_range(2, 2048).for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(efConstruction)
@@ -55,6 +61,20 @@ class BaseHnswConfig : public BaseConfig {
         KNOWHERE_CONFIG_DECLARE_FIELD(disable_fallback_brute_force)
             .description("disable fallback brute force")
             .set_default(false)
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(enable_jag)
+            .description("enable JAG (filter-guided) search strategy")
+            .set_default(false)
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(jag_filter_weight)
+            .description("weight for filter distance in combined score (JAG)")
+            .set_default(1.0f)
+            .set_range(0.0f, 100.0f)
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(jag_candidate_pool_size)
+            .description("candidate pool size for JAG (0 = auto, efSearch * 4)")
+            .set_default(0)
+            .set_range(0, std::numeric_limits<CFG_INT::value_type>::max())
             .for_search();
     }
 

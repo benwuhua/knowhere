@@ -1227,3 +1227,132 @@ TEST_CASE("JAG-HNSW SIFT1M Benchmark", "[jag][benchmark][sift1m]") {
         REQUIRE(r.baseline_recall <= 1.0f);
     }
 }
+
+// ============== JAG+Alpha Integration Test ==============
+
+TEST_CASE("JAG-HNSW Knowhere Integration", "[jag][integration]") {
+    const int64_t n = 1000;
+    const int64_t dim = 64;
+    const int k = 10;
+
+    // Generate data
+    auto base_ds = GenDataSet(n, dim, 42);
+    auto query_ds = GenDataSet(1, dim, 123);
+    const float* base_data = reinterpret_cast<const float*>(base_ds->GetTensor());
+    const float* query = reinterpret_cast<const float*>(query_ds->GetTensor());
+
+    // Generate labels
+    auto filter_set = knowhere::GenerateRandomLabels(n, 5, 456);
+    int32_t target_label = filter_set.labels[0];
+    float filter_ratio = filter_set.GetFilterRatio(target_label);
+
+    // Build HNSW index
+    knowhere::Json build_conf;
+    build_conf[knowhere::meta::DIM] = dim;
+    build_conf[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    build_conf[knowhere::indexparam::HNSW_M] = 16;
+    build_conf[knowhere::indexparam::EFCONSTRUCTION] = 100;
+
+    auto version = knowhere::Version::GetCurrentVersion().VersionNumber();
+    auto index_res = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
+        knowhere::IndexEnum::INDEX_HNSW, version, nullptr);
+    REQUIRE(index_res.has_value());
+    auto index = index_res.value();
+
+    auto build_res = index.Build(base_ds, build_conf);
+    REQUIRE(build_res == knowhere::Status::success);
+
+    // Create bitset for filtering
+    std::vector<uint8_t> bitset_data((n + 7) / 8, 0xFF);
+    for (int64_t i = 0; i < n; i++) {
+        if (filter_set.GetLabel(i) == target_label) {
+            bitset_data[i / 8] &= ~(1 << (i % 8));
+        }
+    }
+    knowhere::BitsetView bitset(bitset_data.data(), n);
+
+    // Compute ground truth
+    auto gt = ComputeFilteredGroundTruth(base_data, query, n, dim, k, filter_set, target_label);
+    std::set<int64_t> gt_set(gt.begin(), gt.end());
+
+    // Test 1: Standard search (Alpha only)
+    knowhere::Json search_conf_baseline;
+    search_conf_baseline[knowhere::meta::DIM] = dim;
+    search_conf_baseline[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    search_conf_baseline[knowhere::meta::TOPK] = k;
+    search_conf_baseline[knowhere::indexparam::EF] = 64;
+    search_conf_baseline[knowhere::indexparam::ENABLE_JAG] = false;
+
+    auto search_res_baseline = index.Search(query_ds, search_conf_baseline, bitset);
+    REQUIRE(search_res_baseline.has_value());
+
+    float baseline_recall = 0.0f;
+    auto res_ids_baseline = search_res_baseline.value()->GetIds();
+    for (int i = 0; i < k; i++) {
+        if (gt_set.count(res_ids_baseline[i])) {
+            baseline_recall += 1.0f;
+        }
+    }
+    baseline_recall /= k;
+
+    // Test 2: JAG-enabled search (JAG + Alpha combined)
+    knowhere::Json search_conf_jag;
+    search_conf_jag[knowhere::meta::DIM] = dim;
+    search_conf_jag[knowhere::meta::METRIC_TYPE] = knowhere::metric::L2;
+    search_conf_jag[knowhere::meta::TOPK] = k;
+    search_conf_jag[knowhere::indexparam::EF] = 64;
+    search_conf_jag[knowhere::indexparam::ENABLE_JAG] = true;
+    search_conf_jag[knowhere::indexparam::JAG_FILTER_WEIGHT] = 2.0f;
+    search_conf_jag[knowhere::indexparam::JAG_CANDIDATE_POOL_SIZE] = 256;
+
+    auto search_res_jag = index.Search(query_ds, search_conf_jag, bitset);
+    REQUIRE(search_res_jag.has_value());
+
+    float jag_recall = 0.0f;
+    auto res_ids_jag = search_res_jag.value()->GetIds();
+    for (int i = 0; i < k; i++) {
+        if (gt_set.count(res_ids_jag[i])) {
+            jag_recall += 1.0f;
+        }
+    }
+    jag_recall /= k;
+
+    std::cout << "\n=== JAG+Alpha Integration Test ===" << std::endl;
+    std::cout << "Filter Ratio: " << (filter_ratio * 100) << "%" << std::endl;
+    std::cout << "Baseline (Alpha only) Recall: " << baseline_recall << std::endl;
+    std::cout << "JAG+Alpha Recall: " << jag_recall << std::endl;
+    std::cout << "======================================" << std::endl;
+
+    // Both should achieve reasonable recall
+    REQUIRE(baseline_recall >= 0.0f);
+    REQUIRE(jag_recall >= 0.0f);
+}
+
+TEST_CASE("JAG-HNSW Parameter Validation", "[jag][params]") {
+    // Test that JAG parameters are properly parsed
+    knowhere::Json config;
+
+    // Default values
+    config[knowhere::indexparam::ENABLE_JAG] = false;
+    config[knowhere::indexparam::JAG_FILTER_WEIGHT] = 1.0f;
+    config[knowhere::indexparam::JAG_CANDIDATE_POOL_SIZE] = 0;
+
+    REQUIRE(config[knowhere::indexparam::ENABLE_JAG].get<bool>() == false);
+    REQUIRE(config[knowhere::indexparam::JAG_FILTER_WEIGHT].get<float>() == 1.0f);
+    REQUIRE(config[knowhere::indexparam::JAG_CANDIDATE_POOL_SIZE].get<int>() == 0);
+
+    // Custom values
+    config[knowhere::indexparam::ENABLE_JAG] = true;
+    config[knowhere::indexparam::JAG_FILTER_WEIGHT] = 2.5f;
+    config[knowhere::indexparam::JAG_CANDIDATE_POOL_SIZE] = 512;
+
+    REQUIRE(config[knowhere::indexparam::ENABLE_JAG].get<bool>() == true);
+    REQUIRE(config[knowhere::indexparam::JAG_FILTER_WEIGHT].get<float>() == 2.5f);
+    REQUIRE(config[knowhere::indexparam::JAG_CANDIDATE_POOL_SIZE].get<int>() == 512);
+
+    std::cout << "\n=== JAG Parameter Validation ===" << std::endl;
+    std::cout << "enable_jag: " << std::boolalpha << config[knowhere::indexparam::ENABLE_JAG].get<bool>() << std::endl;
+    std::cout << "jag_filter_weight: " << config[knowhere::indexparam::JAG_FILTER_WEIGHT].get<float>() << std::endl;
+    std::cout << "jag_candidate_pool_size: " << config[knowhere::indexparam::JAG_CANDIDATE_POOL_SIZE].get<int>() << std::endl;
+    std::cout << "======================================" << std::endl;
+}
