@@ -331,8 +331,10 @@ RunBenchmark(const knowhere::Index<knowhere::IndexNode>& index, const LoadedData
 // ============== Test Cases ==============
 
 // Helper to get filter_weight from environment variable
-// Default 0.4 provides good balance between recall (~84%) and QPS improvement (~49%)
-static float GetJagFilterWeight(float default_value = 0.4f) {
+// Default 0.3 provides ~87% recall with ~12-15% QPS improvement
+// Higher weight = invalid nodes ranked lower = better QPS but potentially lower recall
+// Lower weight = more exploration = higher recall but lower QPS
+static float GetJagFilterWeight(float default_value = 0.3f) {
     const char* env_val = std::getenv("JAG_FILTER_WEIGHT");
     if (env_val != nullptr) {
         try {
@@ -347,7 +349,7 @@ static float GetJagFilterWeight(float default_value = 0.4f) {
 TEST_CASE("JAG Multi-Dataset Benchmark - All Datasets", "[jag][benchmark][multidataset]") {
     const int k = 10;
     const int num_queries = 100;
-    const float jag_filter_weight = GetJagFilterWeight(0.4f);
+    const float jag_filter_weight = GetJagFilterWeight(0.3f);
 
     std::cout << "\n" << std::string(80, '=') << std::endl;
     std::cout << "JAG Multi-Dataset Benchmark" << std::endl;

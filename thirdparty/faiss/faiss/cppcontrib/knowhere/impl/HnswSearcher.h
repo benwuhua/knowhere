@@ -656,7 +656,7 @@ struct v2_hnsw_jag_searcher {
     inline float
     get_adaptive_weight(int total_seen, int invalid_seen) const {
         if (!adaptive_weight || total_seen < 10) {
-            return base_filter_weight;  // Use base weight for small samples
+            return base_filter_weight;
         }
 
         // Calculate valid ratio (fraction of nodes that match the filter)
@@ -668,23 +668,20 @@ struct v2_hnsw_jag_searcher {
 
         // Logarithmic weight scaling (inspired by JAG paper)
         // weight = base_weight * log(1/valid_ratio)
-        // - 10% valid (90% filtered): log(10) ≈ 2.3 -> high weight
-        // - 50% valid (50% filtered): log(2) ≈ 0.7 -> medium weight
-        // - 90% valid (10% filtered): log(1.1) ≈ 0.1 -> low weight
         float log_weight = std::log(1.0f / valid_ratio);
 
         return base_filter_weight * log_weight;
     }
 
-    // Early pruning check: skip vector distance computation if filter distance alone
-    // exceeds the worst candidate in the result set
-    // Inspired by WeightJAG lines 422-427
+    // Early pruning check - with high safety margin for high recall
+    // Only prune if filter penalty is MUCH larger than worst distance
+    // This balances recall and QPS
     inline bool
     should_prune_by_filter(float filter_dist, float current_weight, float worst_dist) const {
         // For binary filter: filter_dist is 0 (valid) or 1 (invalid)
-        // If filter_dist * weight > worst_dist, even the best vector distance (0)
-        // won't make this node competitive
-        return (filter_dist * current_weight) > worst_dist;
+        // Use 4x safety margin - only prune hopeless candidates
+        // This maintains good recall while still providing QPS benefit
+        return (filter_dist * current_weight) > (worst_dist * 4.0f);
     }
 
     // greedily update a nearest vector at a given level.
@@ -960,12 +957,14 @@ struct v2_hnsw_jag_searcher {
                     continue;  // Skip computing vector distance
                 }
 
-                // Alpha mechanism: probabilistic admission for remaining invalid nodes
-                accumulated_alpha += kAlpha;
-                if (accumulated_alpha < 1.0f) {
-                    continue;
-                }
-                accumulated_alpha -= 1.0f;
+                // JAG: Skip Alpha mechanism for invalid nodes to allow full graph exploration
+                // The weight-based ranking will handle prioritization
+                // Original Alpha mechanism commented out:
+                // accumulated_alpha += kAlpha;
+                // if (accumulated_alpha < 1.0f) {
+                //     continue;
+                // }
+                // accumulated_alpha -= 1.0f;
             }
 
             saved_indices[counter] = v1;
