@@ -826,6 +826,8 @@ DiskANNIndexNode<DataType>::Search(const DataSetPtr dataset, std::unique_ptr<Con
     auto lsearch = static_cast<uint64_t>(search_conf.search_list_size.value());
     auto beamwidth = static_cast<uint64_t>(search_conf.beamwidth.value());
     auto filter_ratio = static_cast<float>(search_conf.filter_threshold.value());
+    auto enable_jag = search_conf.enable_jag.value();
+    auto jag_filter_weight = static_cast<float>(search_conf.jag_filter_weight.value());
     auto nq = dataset->GetRows();
     auto dim = dataset->GetDim();
     auto xq = static_cast<const DataType*>(dataset->GetTensor());
@@ -876,7 +878,7 @@ DiskANNIndexNode<DataType>::Search(const DataSetPtr dataset, std::unique_ptr<Con
             diskann::QueryStats stats;
             pq_flash_index_->cached_beam_search(xq + (index * dim), k, lsearch, p_id_ptr + (index * k),
                                                 p_dist_ptr + (index * k), beamwidth, false, &stats, feder_result,
-                                                bitset, filter_ratio);
+                                                bitset, filter_ratio, enable_jag, jag_filter_weight);
 #ifdef NOT_COMPILE_FOR_SWIG
             knowhere_diskann_search_hops.Observe(stats.n_hops);
 #endif

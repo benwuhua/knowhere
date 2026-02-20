@@ -83,6 +83,13 @@ class DiskANNConfig : public BaseConfig {
     // value should be in range of [0.0, 1.0] which means when greater or equal to x% of the bits are set,
     // use PQ + Refine. Default to -1.0f, negative vlaues will use dynamic threshold calculator given topk.
     CFG_FLOAT filter_threshold;
+
+    // JAG (Join-And-AGgregate) search optimization for filtered queries
+    // Enables combined distance ranking: combined = vec_dist + weight * filter_dist
+    CFG_BOOL enable_jag;
+    // Weight for filter distance in JAG combined score
+    CFG_FLOAT jag_filter_weight;
+
     KNOHWERE_DECLARE_CONFIG(DiskANNConfig) {
         KNOWHERE_CONFIG_DECLARE_FIELD(max_degree)
             .description("the degree of the graph index.")
@@ -161,6 +168,17 @@ class DiskANNConfig : public BaseConfig {
             .description("the threshold of filter ratio to use PQ + Refine.")
             .set_default(-1.0f)
             .set_range(-1.0f, 1.0f)
+            .for_search()
+            .for_iterator();
+        KNOWHERE_CONFIG_DECLARE_FIELD(enable_jag)
+            .description("enable JAG (Join-And-AGgregate) search optimization for filtered queries.")
+            .set_default(false)
+            .for_search()
+            .for_iterator();
+        KNOWHERE_CONFIG_DECLARE_FIELD(jag_filter_weight)
+            .description("weight for filter distance in JAG combined score. Higher values prioritize valid nodes more.")
+            .set_default(0.3f)
+            .set_range(0.0f, 10.0f)
             .for_search()
             .for_iterator();
     }
