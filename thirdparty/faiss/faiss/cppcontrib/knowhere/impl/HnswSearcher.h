@@ -17,6 +17,7 @@
 // standard headers
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -293,8 +294,9 @@ struct v2_hnsw_searcher {
 
     // perform the search on a given level.
     // it is assumed that retset is initialized and contains the initial nodes.
+    template <typename RetSetT>
     faiss::HNSWStats search_on_a_level(
-            knowhere::NeighborSetDoublePopList& retset,
+            RetSetT& retset,
             const int level,
             knowhere::IteratorMinHeap* const __restrict disqualified = nullptr,
             const float initial_accumulated_alpha = 1.0f) {
@@ -567,6 +569,7 @@ struct v2_hnsw_searcher {
 // maintaining compatibility with efficient NeighborSetDoublePopList
 // Key optimization: Store combined_dist in Neighbor.distance for ranking,
 //                  collect all candidates, then filter and sort by actual distance
+// v3: Added adaptive filter_weight based on observed filter ratio
 template <
         typename DistanceComputerT,
         typename GraphVisitorT,
@@ -595,7 +598,8 @@ struct v2_hnsw_jag_searcher {
     const float kAlpha;
 
     // JAG parameters
-    const float filter_weight;          // Weight for filter distance in combined score
+    const float base_filter_weight;    // Base weight for filter distance
+    const bool adaptive_weight;         // Enable adaptive weight adjustment
 
     // custom parameters of HNSW search.
     const faiss::SearchParametersHNSW* params;
@@ -617,7 +621,8 @@ struct v2_hnsw_jag_searcher {
               visited_nodes{visited_nodes_},
               filter{filter_},
               kAlpha{kAlpha_},
-              filter_weight{filter_weight_},
+              base_filter_weight{filter_weight_},
+              adaptive_weight{filter_weight_ > 0},  // Enable adaptive if weight > 0
               params{params_} {}
 
     v2_hnsw_jag_searcher(const v2_hnsw_jag_searcher&) = delete;
@@ -626,9 +631,60 @@ struct v2_hnsw_jag_searcher {
     v2_hnsw_jag_searcher& operator=(v2_hnsw_jag_searcher&&) = delete;
 
     // Compute combined distance for JAG ranking
+    // Goal: invalid nodes should have WORSE priority than valid nodes
+    // For L2 (positive): larger distance = worse, so add penalty
+    // For IP (negative): more negative = better, so we need to make invalid LESS negative (closer to 0)
+    // Therefore: penalty direction is the same (always positive), but effect on ranking differs
+    // Solution: Use absolute value comparison in NeighborSetDoublePopList instead
+    // Here we keep combined distance such that abs(invalid_combined) > abs(valid_combined)
     inline float
-    compute_combined_dist(float vec_dist, bool is_filtered) const {
-        return vec_dist + filter_weight * (is_filtered ? 1.0f : 0.0f);
+    compute_combined_dist(float vec_dist, bool is_filtered, float current_weight) const {
+        if (!is_filtered) {
+            return vec_dist;  // No penalty for valid nodes
+        }
+        // For both L2 and IP, we want invalid nodes to be deprioritized
+        // L2: dist > 0, combined = dist + weight (larger = worse) ✓
+        // IP: dist < 0, combined = dist + weight (closer to 0 = worse in min-heap) ✓
+        // So we always add the weight
+        return vec_dist + current_weight;
+    }
+
+    // Adaptive weight calculation based on observed filter ratio
+    // Uses logarithmic scaling like the JAG paper: weight = log(1/p)
+    // where p is the fraction of valid nodes
+    // This gives higher weights when fewer nodes are valid (higher filter ratio)
+    inline float
+    get_adaptive_weight(int total_seen, int invalid_seen) const {
+        if (!adaptive_weight || total_seen < 10) {
+            return base_filter_weight;  // Use base weight for small samples
+        }
+
+        // Calculate valid ratio (fraction of nodes that match the filter)
+        int valid_seen = total_seen - invalid_seen;
+        float valid_ratio = static_cast<float>(valid_seen) / total_seen;
+
+        // Avoid log(0) by using minimum ratio
+        valid_ratio = std::max(valid_ratio, 0.01f);
+
+        // Logarithmic weight scaling (inspired by JAG paper)
+        // weight = base_weight * log(1/valid_ratio)
+        // - 10% valid (90% filtered): log(10) ≈ 2.3 -> high weight
+        // - 50% valid (50% filtered): log(2) ≈ 0.7 -> medium weight
+        // - 90% valid (10% filtered): log(1.1) ≈ 0.1 -> low weight
+        float log_weight = std::log(1.0f / valid_ratio);
+
+        return base_filter_weight * log_weight;
+    }
+
+    // Early pruning check: skip vector distance computation if filter distance alone
+    // exceeds the worst candidate in the result set
+    // Inspired by WeightJAG lines 422-427
+    inline bool
+    should_prune_by_filter(float filter_dist, float current_weight, float worst_dist) const {
+        // For binary filter: filter_dist is 0 (valid) or 1 (invalid)
+        // If filter_dist * weight > worst_dist, even the best vector distance (0)
+        // won't make this node competitive
+        return (filter_dist * current_weight) > worst_dist;
     }
 
     // greedily update a nearest vector at a given level.
@@ -747,7 +803,7 @@ struct v2_hnsw_jag_searcher {
 
                     // JAG: Use combined distance for ranking
                     bool is_filtered = (saved_statuses[id4] == knowhere::Neighbor::kInvalid);
-                    float combined = compute_combined_dist(dis[id4], is_filtered);
+                    float combined = compute_combined_dist(dis[id4], is_filtered, base_filter_weight);
 
                     // Store combined distance in distance field for ranking
                     knowhere::Neighbor nn(saved_indices[id4], combined, saved_statuses[id4]);
@@ -766,7 +822,7 @@ struct v2_hnsw_jag_searcher {
             graph_visitor.visit_edge(level, node_id, saved_indices[id4], dis);
 
             bool is_filtered = (saved_statuses[id4] == knowhere::Neighbor::kInvalid);
-            float combined = compute_combined_dist(dis, is_filtered);
+            float combined = compute_combined_dist(dis, is_filtered, base_filter_weight);
 
             knowhere::Neighbor nn(saved_indices[id4], combined, saved_statuses[id4]);
             func_add_candidate(nn);
@@ -780,11 +836,11 @@ struct v2_hnsw_jag_searcher {
         return stats;
     }
 
-    // Search on a level using JAG ranking
-    // Optimized v2: Use retset directly, no separate valid_candidates vector
-    // Key insight: valid_ns_ in NeighborSetDoublePopList stores valid neighbors by actual distance
+    // Search on a level using JAG ranking with adaptive weight
+    // v3: Track filter ratio and adapt weight dynamically
+    // v4: Add early pruning based on filter distance
     faiss::HNSWStats search_on_a_level_jag_v2(
-            knowhere::NeighborSetDoublePopList& retset,
+            knowhere::NeighborSetDoublePopListJAG& retset,
             const int level,
             const idx_t k,
             float* __restrict distances,
@@ -794,6 +850,11 @@ struct v2_hnsw_jag_searcher {
 
         float accumulated_alpha = initial_accumulated_alpha;
 
+        // Track filter ratio for adaptive weight
+        int total_nodes_seen = 0;
+        int invalid_nodes_seen = 0;
+        float current_weight = base_filter_weight;
+
         auto add_search_candidate = [&](const knowhere::Neighbor& n) {
             return retset.insert(n);
         };
@@ -801,10 +862,22 @@ struct v2_hnsw_jag_searcher {
         while (retset.has_next()) {
             const knowhere::Neighbor neighbor = retset.pop();
 
+            // Update adaptive weight periodically
+            if (adaptive_weight && total_nodes_seen > 0 && total_nodes_seen % 50 == 0) {
+                current_weight = get_adaptive_weight(total_nodes_seen, invalid_nodes_seen);
+            }
+
+            // Get worst distance in result set for early pruning
+            float worst_dist = retset.at_search_back_dist();
+
             faiss::HNSWStats local_stats = evaluate_single_node_jag_v2(
                     neighbor.id,
                     level,
                     accumulated_alpha,
+                    current_weight,
+                    worst_dist,
+                    total_nodes_seen,
+                    invalid_nodes_seen,
                     add_search_candidate);
 
             if (track_hnsw_stats) {
@@ -813,11 +886,13 @@ struct v2_hnsw_jag_searcher {
         }
 
         // Extract results directly from retset's valid_ns_
-        // retset already maintains valid neighbors sorted by distance
+        // Note: valid neighbors have actual distance stored (combined = actual for valid nodes)
+        // No need to recompute - nbr.distance is already the correct value
         const idx_t len = std::min((idx_t)retset.size(), k);
         for (idx_t i = 0; i < len; i++) {
             const auto& nbr = retset[i];
-            distances[i] = nbr.distance;  // Already actual distance
+            // For valid nodes, combined_dist = actual_dist, so no recomputation needed
+            distances[i] = nbr.distance;
             labels[i] = nbr.id;
         }
 
@@ -832,11 +907,17 @@ struct v2_hnsw_jag_searcher {
 
     // Optimized v2: For valid neighbors, store actual distance
     // For invalid neighbors, store combined distance (for ranking in invalid_ns_)
+    // v3: Accept current_weight and track filter ratio
+    // v4: Add early pruning based on filter distance
     template <typename FuncAddCandidate>
     faiss::HNSWStats evaluate_single_node_jag_v2(
             const idx_t node_id,
             const int level,
             float& accumulated_alpha,
+            const float current_weight,
+            const float worst_dist,
+            int& total_nodes_seen,
+            int& invalid_nodes_seen,
             FuncAddCandidate func_add_candidate) {
         faiss::HNSWStats stats;
 
@@ -849,6 +930,8 @@ struct v2_hnsw_jag_searcher {
         bool saved_is_valid[4];  // true = valid, false = invalid
 
         size_t ndis = 0;
+        int early_pruned = 0;  // Count of nodes pruned by early filter check
+
         for (size_t j = begin; j < end; j++) {
             const storage_idx_t v1 = hnsw.neighbors[j];
 
@@ -864,8 +947,20 @@ struct v2_hnsw_jag_searcher {
             visited_nodes.set(v1);
 
             bool is_valid = filter.is_member(v1);
+            total_nodes_seen++;
             if (!is_valid) {
-                // Alpha mechanism: probabilistic admission
+                invalid_nodes_seen++;
+
+                // Early pruning: skip vector distance computation if filter distance alone
+                // exceeds the worst distance in the result set
+                // Inspired by JAG paper WeightJAG lines 422-427
+                // For binary filter: filter_dist = 1, so check if weight > worst_dist
+                if (should_prune_by_filter(1.0f, current_weight, worst_dist)) {
+                    early_pruned++;
+                    continue;  // Skip computing vector distance
+                }
+
+                // Alpha mechanism: probabilistic admission for remaining invalid nodes
                 accumulated_alpha += kAlpha;
                 if (accumulated_alpha < 1.0f) {
                     continue;
@@ -894,16 +989,13 @@ struct v2_hnsw_jag_searcher {
                     graph_visitor.visit_edge(
                             level, node_id, saved_indices[id4], dis[id4]);
 
-                    if (saved_is_valid[id4]) {
-                        // Valid: store actual distance (sorted in valid_ns_)
-                        knowhere::Neighbor nn(saved_indices[id4], dis[id4], knowhere::Neighbor::kValid);
-                        func_add_candidate(nn);
-                    } else {
-                        // Invalid: store combined distance (for ranking in invalid_ns_)
-                        float combined = compute_combined_dist(dis[id4], true);
-                        knowhere::Neighbor nn(saved_indices[id4], combined, knowhere::Neighbor::kInvalid);
-                        func_add_candidate(nn);
-                    }
+                    // JAG v3: Use combined distance with current (adaptive) weight
+                    // For valid nodes: combined = dis (no penalty)
+                    // For invalid nodes: combined = dis + current_weight (penalty)
+                    float combined = compute_combined_dist(dis[id4], !saved_is_valid[id4], current_weight);
+                    int status = saved_is_valid[id4] ? knowhere::Neighbor::kValid : knowhere::Neighbor::kInvalid;
+                    knowhere::Neighbor nn(saved_indices[id4], combined, status);
+                    func_add_candidate(nn);
                 }
 
                 counter = 0;
@@ -916,14 +1008,11 @@ struct v2_hnsw_jag_searcher {
 
             graph_visitor.visit_edge(level, node_id, saved_indices[id4], dis);
 
-            if (saved_is_valid[id4]) {
-                knowhere::Neighbor nn(saved_indices[id4], dis, knowhere::Neighbor::kValid);
-                func_add_candidate(nn);
-            } else {
-                float combined = compute_combined_dist(dis, true);
-                knowhere::Neighbor nn(saved_indices[id4], combined, knowhere::Neighbor::kInvalid);
-                func_add_candidate(nn);
-            }
+            // JAG v3: Use combined distance with current (adaptive) weight
+            float combined = compute_combined_dist(dis, !saved_is_valid[id4], current_weight);
+            int status = saved_is_valid[id4] ? knowhere::Neighbor::kValid : knowhere::Neighbor::kInvalid;
+            knowhere::Neighbor nn(saved_indices[id4], combined, status);
+            func_add_candidate(nn);
         }
 
         if (track_hnsw_stats) {
@@ -1002,7 +1091,7 @@ struct v2_hnsw_jag_searcher {
 
                     // JAG: Use combined distance for ranking
                     bool is_filtered = (saved_statuses[id4] == knowhere::Neighbor::kInvalid);
-                    float combined = compute_combined_dist(dis[id4], is_filtered);
+                    float combined = compute_combined_dist(dis[id4], is_filtered, base_filter_weight);
 
                     // Store combined distance for ranking, pass actual distance to callback
                     knowhere::Neighbor nn(saved_indices[id4], combined, saved_statuses[id4]);
@@ -1020,7 +1109,7 @@ struct v2_hnsw_jag_searcher {
             graph_visitor.visit_edge(level, node_id, saved_indices[id4], dis);
 
             bool is_filtered = (saved_statuses[id4] == knowhere::Neighbor::kInvalid);
-            float combined = compute_combined_dist(dis, is_filtered);
+            float combined = compute_combined_dist(dis, is_filtered, base_filter_weight);
 
             knowhere::Neighbor nn(saved_indices[id4], combined, saved_statuses[id4]);
             func_add_candidate(nn, dis);  // Pass actual distance
@@ -1085,14 +1174,14 @@ struct v2_hnsw_jag_searcher {
         // level 0 search
         graph_visitor.visit_level(0);
 
-        // For JAG v2: Use NeighborSetDoublePopList to directly manage valid/invalid neighbors
+        // For JAG v2: Use NeighborSetDoublePopListJAG (absolute value comparison for IP distance)
         const idx_t n_candidates = std::max((idx_t)efSearch, k);
-        knowhere::NeighborSetDoublePopList retset(n_candidates);
+        knowhere::NeighborSetDoublePopListJAG retset(n_candidates);
 
         // Initialize retset with entry point
         {
             bool is_valid = filter.is_member(nearest);
-            float dist_to_store = is_valid ? d_nearest : compute_combined_dist(d_nearest, true);
+            float dist_to_store = is_valid ? d_nearest : compute_combined_dist(d_nearest, true, base_filter_weight);
             int status = is_valid ? knowhere::Neighbor::kValid : knowhere::Neighbor::kInvalid;
 
             retset.insert(knowhere::Neighbor(nearest, dist_to_store, status));

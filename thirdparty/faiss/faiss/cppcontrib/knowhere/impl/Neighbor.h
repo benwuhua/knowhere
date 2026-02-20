@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -152,11 +153,25 @@ class NeighborSetPopList {
     std::vector<Neighbor> data_;
 };
 
+// NeighborSetDoublePopList with configurable comparison
+// UseAbsCompare: true = use absolute value comparison (for JAG with IP distance)
+//                false = use direct comparison (original behavior, for L2 and Alpha-only)
+template <bool UseAbsCompare = false>
 class NeighborSetDoublePopList {
  public:
     explicit NeighborSetDoublePopList(size_t capacity = 0) {
         valid_ns_ = std::make_unique<NeighborSetPopList<true>>(capacity);
         invalid_ns_ = std::make_unique<NeighborSetPopList<false>>(capacity);
+    }
+
+    // Compare distances based on template parameter
+    static inline bool
+    compare_distance(float a, float b) {
+        if constexpr (UseAbsCompare) {
+            return std::fabs(a) < std::fabs(b);
+        } else {
+            return a < b;
+        }
     }
 
     // will push any neighbor that does not fit into NeighborSet to disqualified.
@@ -168,7 +183,10 @@ class NeighborSetDoublePopList {
         if (nbr.status == Neighbor::kValid) {
             return valid_ns_->insert(nbr, disqualified);
         } else {
-            if (nbr.distance < valid_ns_->at_search_back_dist()) {
+            float back_dist = valid_ns_->at_search_back_dist();
+            bool should_insert = compare_distance(nbr.distance, back_dist) ||
+                                 (back_dist == std::numeric_limits<float>::max());
+            if (should_insert) {
                 return invalid_ns_->insert(nbr, disqualified);
             } else if (disqualified) {
                 disqualified->push(nbr);
@@ -183,8 +201,11 @@ class NeighborSetDoublePopList {
 
     auto
     has_next() const -> bool {
+        float back_dist = valid_ns_->at_search_back_dist();
         return valid_ns_->has_next() ||
-               (invalid_ns_->has_next() && invalid_ns_->cur().distance < valid_ns_->at_search_back_dist());
+               (invalid_ns_->has_next() &&
+                (compare_distance(invalid_ns_->cur().distance, back_dist) ||
+                 back_dist == std::numeric_limits<float>::max()));
     }
 
     inline const Neighbor&
@@ -197,6 +218,13 @@ class NeighborSetDoublePopList {
         return valid_ns_->size();
     }
 
+    // Get the worst (largest) distance in the valid neighbor set
+    // Used for early pruning in JAG search
+    inline float
+    at_search_back_dist() const {
+        return valid_ns_->at_search_back_dist();
+    }
+
  private:
     auto
     pop_based_on_distance() -> Neighbor {
@@ -204,7 +232,8 @@ class NeighborSetDoublePopList {
         bool hasResNext = valid_ns_->has_next();
 
         if (hasCandNext && hasResNext) {
-            return invalid_ns_->cur().distance < valid_ns_->cur().distance ? invalid_ns_->pop() : valid_ns_->pop();
+            return compare_distance(invalid_ns_->cur().distance, valid_ns_->cur().distance)
+                   ? invalid_ns_->pop() : valid_ns_->pop();
         }
         if (hasCandNext != hasResNext) {
             return hasCandNext ? invalid_ns_->pop() : valid_ns_->pop();
@@ -215,6 +244,11 @@ class NeighborSetDoublePopList {
     std::unique_ptr<NeighborSetPopList<true>> valid_ns_ = nullptr;
     std::unique_ptr<NeighborSetPopList<false>> invalid_ns_ = nullptr;
 };
+
+// Type alias for backward compatibility (original behavior)
+using NeighborSetDoublePopListOriginal = NeighborSetDoublePopList<false>;
+// Type alias for JAG search (uses absolute value comparison)
+using NeighborSetDoublePopListJAG = NeighborSetDoublePopList<true>;
 
 static inline int
 InsertIntoPool(Neighbor* addr, intptr_t size, Neighbor nn) {
