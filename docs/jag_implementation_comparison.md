@@ -198,6 +198,11 @@ inline bool should_prune_by_filter(float filter_dist, float current_weight, floa
    - 距离 = 到范围边界的比例距离
    - 范围内点距离=0，范围外点距离为到最近边界的距离
 
+3. ~~**支持 Sparse 过滤**~~ ✅ 已实现 IDF 加权版本
+   - 实现 `SparseFilterSet`, `SparseFilterConstraint`, `SparseFilterDistance`
+   - 每点可有多标签，支持部分匹配
+   - IDF 加权：稀有标签权重更高
+
 ### 8.2 长期优化 (3-6月)
 
 1. **完整 Filter 类型支持**
@@ -262,7 +267,9 @@ inline bool should_prune_by_filter(float filter_dist, float current_weight, floa
 | 早剪枝优化 | ✅ 已实现 | 减少不必要的向量距离计算 |
 | 默认权重优化 | ✅ 已完成 | 0.1 (优化低过滤率场景) |
 | normalized_h 在线估计 | ✅ 已实现 | 论文核心公式，无需预计算 |
+| Label 过滤支持 | ✅ 已实现 | 二进制距离 (0/1) |
 | Range 过滤支持 | ✅ 已实现 | 比例距离，支持边界检测 |
+| Sparse 过滤支持 | ✅ 已实现 | IDF 加权多标签过滤 |
 | Multi-Tier 搜索 | ⚠️ 已移除 | 复杂度不值得收益 |
 
 ---
@@ -278,4 +285,5 @@ inline bool should_prune_by_filter(float filter_dist, float current_weight, floa
 | normalized_h 计算 | `WeightJAG/index.h:init()` (预计算) | `HnswSearcher.h:estimate_normalized_h()` (在线) | ✅ |
 | Label 过滤距离 | `/Paper/JAG/parlayann/utils/filter_check.h` | `filter_distance.h:LabelFilterDistance` | ✅ |
 | Range 过滤距离 | 论文 Section 3.2 | `filter_distance.h:RangeFilterDistance` | ✅ |
+| Sparse 过滤距离 | 论文 Section 3.3 | `filter_distance.h:SparseFilterDistance` | ✅ |
 | Multi-Tier 配置 | `filtered_vector_search_benchmark_main.cc` | 未实现 | ❌ |
