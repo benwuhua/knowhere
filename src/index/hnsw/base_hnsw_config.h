@@ -67,8 +67,8 @@ class BaseHnswConfig : public BaseConfig {
             .set_default(false)
             .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(jag_filter_weight)
-            .description("weight for filter distance in combined score (JAG)")
-            .set_default(1.0f)
+            .description("weight for filter distance in combined score (JAG). Default 0.1 optimized for low filter ratios.")
+            .set_default(0.1f)
             .set_range(0.0f, 100.0f)
             .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(jag_candidate_pool_size)

@@ -32,7 +32,7 @@ struct SearchParametersHNSWWrapper : public faiss::SearchParametersHNSW {
 
     // JAG-HNSW parameters (filter-guided graph traversal)
     bool enable_jag = false;
-    float jag_filter_weight = 1.0f;        // Weight for filter distance in combined score
+    float jag_filter_weight = 0.1f;        // Weight for filter distance in combined score
     int jag_candidate_pool_size = 0;       // 0 = auto (efSearch * 4)
 
     inline ~SearchParametersHNSWWrapper() {

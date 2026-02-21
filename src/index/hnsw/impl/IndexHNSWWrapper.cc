@@ -95,7 +95,7 @@ IndexHNSWWrapper::search(idx_t n, const float* __restrict x, idx_t k, float* __r
 
     float kAlpha = 0.0f;
     bool enable_jag = false;
-    float jag_filter_weight = 1.0f;
+    float jag_filter_weight = 0.1f;
     int jag_candidate_pool_size = 0;
 
     if (params_in) {
