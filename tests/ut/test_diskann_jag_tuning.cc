@@ -37,7 +37,7 @@ error "Missing the <filesystem> header."
 
 namespace {
 
-std::string kDir = fs::current_path().string() + "/diskann_jag_test";
+std::string kDir = fs::current_path().string() + "/diskann_jag_tuning";
 std::string kRawDataPath = kDir + "/raw_data";
 std::string kIndexDir = kDir + "/index";
 std::string kIndexPrefix = kIndexDir + "/diskann";
@@ -46,9 +46,8 @@ constexpr uint32_t kNumRows = 5000;
 constexpr uint32_t kNumQueries = 100;
 constexpr uint32_t kDim = 64;
 constexpr uint32_t kK = 10;
-constexpr float kKnnRecall = 0.8f;
 
-// Generate bitset with specified filter ratio (percentage of bits set = filtered out)
+// Generate bitset with specified filter ratio
 std::vector<uint8_t>
 GenerateBitsetWithFilterRatio(size_t num_rows, float filter_ratio, uint64_t seed = 42) {
     std::vector<uint8_t> bitset((num_rows + 7) / 8, 0);
@@ -68,7 +67,7 @@ GenerateBitsetWithFilterRatio(size_t num_rows, float filter_ratio, uint64_t seed
     return bitset;
 }
 
-// Write raw data to disk for DiskANN
+// Write raw data to disk
 template <typename T>
 void
 WriteRawDataToDisk(const std::string& path, const T* data, size_t n, size_t dim) {
@@ -80,7 +79,7 @@ WriteRawDataToDisk(const std::string& path, const T* data, size_t n, size_t dim)
     writer.close();
 }
 
-// Calculate recall (local version to avoid ambiguity)
+// Calculate recall
 float
 CalcRecall(const knowhere::DataSet& gt, const knowhere::DataSet& result) {
     auto gt_ids = gt.GetIds();
@@ -104,7 +103,7 @@ CalcRecall(const knowhere::DataSet& gt, const knowhere::DataSet& result) {
 
 }  // namespace
 
-TEST_CASE("DiskANN JAG Filtered Search Benchmark", "[diskann][jag]") {
+TEST_CASE("DiskANN JAG Filter Weight Tuning", "[diskann][jag][tuning]") {
     fs::remove_all(kDir);
     fs::remove(kDir);
     REQUIRE_NOTHROW(fs::create_directory(kDir));
@@ -171,21 +170,22 @@ TEST_CASE("DiskANN JAG Filtered Search Benchmark", "[diskann][jag]") {
     auto deserialize_json = build_gen();
     diskann.Deserialize(binset, deserialize_json);
 
-    std::cout << "\n========================================\n";
-    std::cout << "DiskANN JAG Filtered Search Benchmark\n";
-    std::cout << "========================================\n";
+    std::cout << "\n================================================================================\n";
+    std::cout << "DiskANN JAG Filter Weight Tuning\n";
+    std::cout << "================================================================================\n";
     std::cout << "Dataset: " << kNumRows << " vectors, " << kDim << "D\n";
     std::cout << "Queries: " << kNumQueries << ", K: " << kK << "\n";
-    std::cout << "========================================\n\n";
+    std::cout << "================================================================================\n\n";
 
-    // Test different filter ratios
+    // Test different filter ratios and weights
     const std::vector<float> filter_ratios = {0.1f, 0.3f, 0.5f, 0.7f};
-    const std::vector<float> jag_weights = {0.1f, 0.3f, 0.5f, 1.0f, 2.0f};
-
-    std::cout << "Filter% | Baseline_Rcl | JAG_Rcl | Base_QPS | JAG_QPS | QPS_Δ%\n";
-    std::cout << "--------|--------------|---------|----------|---------|-------\n";
+    const std::vector<float> jag_weights = {0.1f, 0.3f, 0.5f, 0.7f, 1.0f, 1.5f, 2.0f, 3.0f, 5.0f};
 
     for (float filter_ratio : filter_ratios) {
+        std::cout << "\n=== Filter Ratio: " << (filter_ratio * 100) << "% ===\n";
+        std::cout << "Weight  | Recall | QPS     | vs Baseline QPS | vs Baseline Recall\n";
+        std::cout << "--------|--------|---------|-----------------|-------------------\n";
+
         auto bitset_data = GenerateBitsetWithFilterRatio(kNumRows, filter_ratio);
         knowhere::BitsetView bitset(bitset_data.data(), kNumRows);
 
@@ -202,9 +202,10 @@ TEST_CASE("DiskANN JAG Filtered Search Benchmark", "[diskann][jag]") {
         float base_recall = CalcRecall(*gt.value(), *base_result.value());
         float base_qps = (base_ms > 0) ? (kNumQueries * 1000.0f / base_ms) : 0;
 
-        // JAG search (with best weight)
-        float best_jag_recall = 0;
-        float best_jag_qps = 0;
+        std::cout << std::fixed << std::setprecision(3);
+        std::cout << "BASE    | " << base_recall << " | " << std::setw(7) << base_qps << " |       -         |       -\n";
+
+        // Test different weights
         for (float weight : jag_weights) {
             auto jag_search_json = search_gen(true, weight);
             auto jag_start = std::chrono::high_resolution_clock::now();
@@ -214,45 +215,39 @@ TEST_CASE("DiskANN JAG Filtered Search Benchmark", "[diskann][jag]") {
             float jag_recall = CalcRecall(*gt.value(), *jag_result.value());
             float jag_qps = (jag_ms > 0) ? (kNumQueries * 1000.0f / jag_ms) : 0;
 
-            // Keep best result that maintains recall
-            if (jag_recall >= base_recall * 0.98f && jag_qps > best_jag_qps) {
-                best_jag_recall = jag_recall;
-                best_jag_qps = jag_qps;
-            }
-        }
+            float qps_delta = (base_qps > 0) ? ((jag_qps - base_qps) / base_qps * 100) : 0;
+            float recall_delta = (jag_recall - base_recall) * 100;
 
-        float qps_delta = (base_qps > 0) ? ((best_jag_qps - base_qps) / base_qps * 100) : 0;
-        std::cout << std::fixed << std::setprecision(1)
-                  << (filter_ratio * 100) << "%   | "
-                  << base_recall << "       | "
-                  << best_jag_recall << "   | "
-                  << base_qps << "   | "
-                  << best_jag_qps << "  | "
-                  << std::showpos << qps_delta << std::noshowpos << "\n";
+            std::cout << std::setw(7) << weight << " | " << jag_recall << " | "
+                      << std::setw(7) << jag_qps << " | " << std::showpos << std::setw(6)
+                      << qps_delta << "%      | " << std::setw(6) << recall_delta << "%"
+                      << std::noshowpos << "\n";
+        }
     }
 
-    std::cout << "\n========================================\n";
-    std::cout << "Analysis:\n";
-    std::cout << "- JAG should show QPS improvement at higher filter ratios\n";
-    std::cout << "- Optimal jag_filter_weight varies (tested 0.3-2.0)\n";
-    std::cout << "- Recall should remain >= baseline\n";
-    std::cout << "========================================\n";
+    std::cout << "\n================================================================================\n";
+    std::cout << "Tuning Recommendations:\n";
+    std::cout << "- Lower weight (0.1-0.5): Better QPS at low filter ratios\n";
+    std::cout << "- Medium weight (0.5-1.5): Balanced recall/QPS trade-off\n";
+    std::cout << "- Higher weight (2.0-5.0): Better recall at high filter ratios\n";
+    std::cout << "================================================================================\n";
 
     // Cleanup
     fs::remove_all(kDir);
     fs::remove(kDir);
 }
 
-TEST_CASE("DiskANN JAG Parameter Validation", "[diskann][jag]") {
+TEST_CASE("DiskANN JAG Optimal Weight Finder", "[diskann][jag][tuning]") {
     fs::remove_all(kDir);
     fs::remove(kDir);
     REQUIRE_NOTHROW(fs::create_directory(kDir));
     REQUIRE_NOTHROW(fs::create_directory(kIndexDir));
 
     auto version = GenTestVersionList();
-    auto base_ds = GenDataSet(kNumRows / 5, kDim, 30);
+    auto base_ds = GenDataSet(kNumRows, kDim, 30);
+    auto query_ds = GenDataSet(kNumQueries, kDim, 42);
     auto base_ptr = static_cast<const float*>(base_ds->GetTensor());
-    WriteRawDataToDisk<float>(kRawDataPath, base_ptr, kNumRows / 5, kDim);
+    WriteRawDataToDisk<float>(kRawDataPath, base_ptr, kNumRows, kDim);
 
     auto build_gen = [&]() {
         knowhere::Json json;
@@ -261,10 +256,24 @@ TEST_CASE("DiskANN JAG Parameter Validation", "[diskann][jag]") {
         json["k"] = kK;
         json["index_prefix"] = kIndexPrefix;
         json["data_path"] = kRawDataPath;
-        json["max_degree"] = 24;
-        json["search_list_size"] = 32;
-        json["pq_code_budget_gb"] = sizeof(float) * kDim * (kNumRows / 5) * 0.125 / (1024 * 1024 * 1024);
+        json["max_degree"] = 32;
+        json["search_list_size"] = 64;
+        json["pq_code_budget_gb"] = sizeof(float) * kDim * kNumRows * 0.125 / (1024 * 1024 * 1024);
+        json["search_cache_budget_gb"] = sizeof(float) * kDim * kNumRows * 0.1 / (1024 * 1024 * 1024);
         json["build_dram_budget_gb"] = 32.0;
+        return json;
+    };
+
+    auto search_gen = [&](bool enable_jag, float jag_weight) {
+        knowhere::Json json;
+        json["dim"] = kDim;
+        json["metric_type"] = knowhere::metric::L2;
+        json["k"] = kK;
+        json["index_prefix"] = kIndexPrefix;
+        json["search_list_size"] = 32;
+        json["beamwidth"] = 8;
+        json["enable_jag"] = enable_jag;
+        json["jag_filter_weight"] = jag_weight;
         return json;
     };
 
@@ -285,23 +294,66 @@ TEST_CASE("DiskANN JAG Parameter Validation", "[diskann][jag]") {
                        .value();
     diskann.Deserialize(binset, build_gen());
 
-    // Test that JAG parameters are accepted
-    knowhere::Json jag_json = build_gen();
-    jag_json["enable_jag"] = true;
-    jag_json["jag_filter_weight"] = 1.5f;
+    std::cout << "\n================================================================================\n";
+    std::cout << "DiskANN JAG Optimal Weight Finder\n";
+    std::cout << "Finding best weight that maintains recall >= baseline while maximizing QPS\n";
+    std::cout << "================================================================================\n\n";
 
-    auto query_ds = GenDataSet(10, kDim, 42);
-    auto bitset_data = GenerateBitsetWithFilterRatio(kNumRows / 5, 0.5f);
-    knowhere::BitsetView bitset(bitset_data.data(), kNumRows / 5);
+    const std::vector<float> filter_ratios = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f};
+    const std::vector<float> jag_weights = {0.05f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.7f, 1.0f, 1.5f, 2.0f};
 
-    auto result = diskann.Search(query_ds, jag_json, bitset);
-    REQUIRE(result.has_value());
+    std::cout << "Filter% | Best Weight | Base_Rcl | JAG_Rcl | Base_QPS | JAG_QPS | QPS_Δ%\n";
+    std::cout << "--------|-------------|----------|---------|----------|---------|-------\n";
 
-    std::cout << "\n=== DiskANN JAG Parameter Validation ===\n";
-    std::cout << "enable_jag: " << jag_json["enable_jag"] << "\n";
-    std::cout << "jag_filter_weight: " << jag_json["jag_filter_weight"] << "\n";
-    std::cout << "Search completed successfully!\n";
-    std::cout << "======================================\n";
+    for (float filter_ratio : filter_ratios) {
+        auto bitset_data = GenerateBitsetWithFilterRatio(kNumRows, filter_ratio);
+        knowhere::BitsetView bitset(bitset_data.data(), kNumRows);
+
+        auto gt = knowhere::BruteForce::Search<knowhere::fp32>(base_ds, query_ds,
+                                                               search_gen(false, 0.0f), bitset);
+
+        // Baseline
+        auto base_result = diskann.Search(query_ds, search_gen(false, 0.0f), bitset);
+        auto base_start = std::chrono::high_resolution_clock::now();
+        base_result = diskann.Search(query_ds, search_gen(false, 0.0f), bitset);
+        auto base_end = std::chrono::high_resolution_clock::now();
+        auto base_ms = std::chrono::duration_cast<std::chrono::milliseconds>(base_end - base_start).count();
+        float base_recall = CalcRecall(*gt.value(), *base_result.value());
+        float base_qps = (base_ms > 0) ? (kNumQueries * 1000.0f / base_ms) : 0;
+
+        // Find best weight
+        float best_weight = 0.0f;
+        float best_qps = base_qps;
+        float best_recall = base_recall;
+
+        for (float weight : jag_weights) {
+            auto jag_start = std::chrono::high_resolution_clock::now();
+            auto jag_result = diskann.Search(query_ds, search_gen(true, weight), bitset);
+            auto jag_end = std::chrono::high_resolution_clock::now();
+            auto jag_ms = std::chrono::duration_cast<std::chrono::milliseconds>(jag_end - jag_start).count();
+            float jag_recall = CalcRecall(*gt.value(), *jag_result.value());
+            float jag_qps = (jag_ms > 0) ? (kNumQueries * 1000.0f / jag_ms) : 0;
+
+            // Prefer higher QPS while maintaining or improving recall
+            if (jag_recall >= base_recall * 0.98f && jag_qps > best_qps) {
+                best_weight = weight;
+                best_qps = jag_qps;
+                best_recall = jag_recall;
+            }
+        }
+
+        float qps_delta = (base_qps > 0) ? ((best_qps - base_qps) / base_qps * 100) : 0;
+        std::cout << std::fixed << std::setprecision(1)
+                  << (filter_ratio * 100) << "%   | "
+                  << std::setw(11) << best_weight << " | "
+                  << base_recall << "   | "
+                  << best_recall << "   | "
+                  << std::setw(7) << base_qps << " | "
+                  << std::setw(7) << best_qps << " | "
+                  << std::showpos << qps_delta << std::noshowpos << "\n";
+    }
+
+    std::cout << "\n================================================================================\n";
 
     // Cleanup
     fs::remove_all(kDir);

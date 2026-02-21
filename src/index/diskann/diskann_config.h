@@ -176,8 +176,8 @@ class DiskANNConfig : public BaseConfig {
             .for_search()
             .for_iterator();
         KNOWHERE_CONFIG_DECLARE_FIELD(jag_filter_weight)
-            .description("weight for filter distance in JAG combined score. Higher values prioritize valid nodes more.")
-            .set_default(0.3f)
+            .description("weight for filter distance in JAG combined score. Higher values prioritize valid nodes more. Default 0.1 optimized for low filter ratios.")
+            .set_default(0.1f)
             .set_range(0.0f, 10.0f)
             .for_search()
             .for_iterator();
