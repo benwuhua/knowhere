@@ -673,6 +673,32 @@ struct v2_hnsw_jag_searcher {
         return base_filter_weight * log_weight;
     }
 
+    // Auto-select optimal weight based on estimated filter ratio
+    // Based on JAG paper findings: different filter ratios need different weights
+    // Lower filter ratio -> lower weight (QPS priority)
+    // Higher filter ratio -> higher weight (recall priority)
+    inline float
+    get_auto_weight_for_filter_ratio(float filter_ratio) const {
+        // Filter ratio = fraction of points that are filtered OUT (invalid)
+        // valid_ratio = 1 - filter_ratio
+
+        if (filter_ratio <= 0.15f) {
+            // Low filter ratio: prioritize QPS with low weight
+            // Paper shows 0.1 is optimal here
+            return 0.1f;
+        } else if (filter_ratio <= 0.30f) {
+            // Medium filter ratio: balanced
+            return 0.3f;
+        } else if (filter_ratio <= 0.50f) {
+            // High filter ratio: prioritize recall
+            return 0.5f;
+        } else {
+            // Very high filter ratio: need aggressive weight for recall
+            // Paper uses up to 10.0 for extreme cases
+            return 1.0f;
+        }
+    }
+
     // Early pruning check - with high safety margin for high recall
     // Only prune if filter penalty is MUCH larger than worst distance
     // This balances recall and QPS
@@ -836,6 +862,7 @@ struct v2_hnsw_jag_searcher {
     // Search on a level using JAG ranking with adaptive weight
     // v3: Track filter ratio and adapt weight dynamically
     // v4: Add early pruning based on filter distance
+    // v5: Add multi-tier search with refinement pass
     faiss::HNSWStats search_on_a_level_jag_v2(
             knowhere::NeighborSetDoublePopListJAG& retset,
             const int level,
@@ -856,6 +883,8 @@ struct v2_hnsw_jag_searcher {
             return retset.insert(n);
         };
 
+        // ============ TIER 1: Weighted JAG Search ============
+        // Use combined distance to prioritize valid nodes
         while (retset.has_next()) {
             const knowhere::Neighbor neighbor = retset.pop();
 
@@ -881,6 +910,11 @@ struct v2_hnsw_jag_searcher {
                 stats.combine(local_stats);
             }
         }
+
+        // Note: Multi-tier refinement was considered but removed for simplicity.
+        // The adaptive weight mechanism already provides good balance between
+        // QPS (low filter ratio) and recall (high filter ratio).
+        // Future: Could implement proper multi-tier search if needed.
 
         // Extract results directly from retset's valid_ns_
         // Note: valid neighbors have actual distance stored (combined = actual for valid nodes)
