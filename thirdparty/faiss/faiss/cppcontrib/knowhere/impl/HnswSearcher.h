@@ -649,6 +649,20 @@ struct v2_hnsw_jag_searcher {
         return vec_dist + current_weight;
     }
 
+    // Compute combined distance with normalized_h adjustment (JAG paper formula)
+    // combined = vec_dist + weight * normalized_h * filter_dist
+    // For binary filter: filter_dist = 0 (valid) or 1 (invalid)
+    inline float
+    compute_combined_dist_with_normalized_h(
+            float vec_dist, bool is_filtered, float current_weight, float normalized_h) const {
+        if (!is_filtered) {
+            return vec_dist;  // No penalty for valid nodes
+        }
+        // Apply the JAG paper formula: combined = vec_dist + weight * normalized_h * filter_dist
+        // filter_dist = 1 for invalid nodes (binary filter)
+        return vec_dist + current_weight * normalized_h;
+    }
+
     // Adaptive weight calculation based on observed filter ratio
     // Uses logarithmic scaling like the JAG paper: weight = log(1/p)
     // where p is the fraction of valid nodes
@@ -697,6 +711,23 @@ struct v2_hnsw_jag_searcher {
             // Paper uses up to 10.0 for extreme cases
             return 1.0f;
         }
+    }
+
+    // Online estimation of normalized_h factor (inspired by JAG paper)
+    // The paper uses: normalized_h[p] = std_vec_dist / std_filter_dist for each point
+    // RWalksVamana variant uses a global: normalized_h = 0.1 * avg_vec_dist / avg_filter_dist
+    // Here we estimate it online from observed distances during search
+    // This avoids O(n) storage and O(n*100) precomputation cost
+    inline float
+    estimate_normalized_h(float sum_vec_dist, float sum_filter_dist, int sample_count) const {
+        if (sample_count < 10 || sum_filter_dist < 0.001f) {
+            return 1.0f;  // Default fallback
+        }
+        // Use ratio of sums (equivalent to ratio of averages)
+        float raw_ratio = sum_vec_dist / sum_filter_dist;
+        // Apply scaling factor of 0.1 as suggested by RWalksVamana
+        // This prevents over-weighting filter distance
+        return 0.1f * raw_ratio;
     }
 
     // Early pruning check - with high safety margin for high recall
@@ -879,6 +910,13 @@ struct v2_hnsw_jag_searcher {
         int invalid_nodes_seen = 0;
         float current_weight = base_filter_weight;
 
+        // Track normalized_h estimation (online estimation from observed distances)
+        // Inspired by JAG paper: normalized_h = std_vec_dist / std_filter_dist
+        // We use: normalized_h = 0.1 * sum_vec_dist / sum_filter_dist
+        float sum_vec_dist = 0.0f;
+        float sum_filter_dist = 0.0f;
+        float estimated_normalized_h = 1.0f;  // Default fallback
+
         auto add_search_candidate = [&](const knowhere::Neighbor& n) {
             return retset.insert(n);
         };
@@ -893,6 +931,11 @@ struct v2_hnsw_jag_searcher {
                 current_weight = get_adaptive_weight(total_nodes_seen, invalid_nodes_seen);
             }
 
+            // Update normalized_h estimation periodically
+            if (total_nodes_seen > 0 && total_nodes_seen % 50 == 0) {
+                estimated_normalized_h = estimate_normalized_h(sum_vec_dist, sum_filter_dist, total_nodes_seen);
+            }
+
             // Get worst distance in result set for early pruning
             float worst_dist = retset.at_search_back_dist();
 
@@ -901,9 +944,12 @@ struct v2_hnsw_jag_searcher {
                     level,
                     accumulated_alpha,
                     current_weight,
+                    estimated_normalized_h,
                     worst_dist,
                     total_nodes_seen,
                     invalid_nodes_seen,
+                    sum_vec_dist,
+                    sum_filter_dist,
                     add_search_candidate);
 
             if (track_hnsw_stats) {
@@ -940,15 +986,19 @@ struct v2_hnsw_jag_searcher {
     // For invalid neighbors, store combined distance (for ranking in invalid_ns_)
     // v3: Accept current_weight and track filter ratio
     // v4: Add early pruning based on filter distance
+    // v6: Add normalized_h estimation for more accurate combined distance
     template <typename FuncAddCandidate>
     faiss::HNSWStats evaluate_single_node_jag_v2(
             const idx_t node_id,
             const int level,
             float& accumulated_alpha,
             const float current_weight,
+            const float estimated_normalized_h,
             const float worst_dist,
             int& total_nodes_seen,
             int& invalid_nodes_seen,
+            float& sum_vec_dist,
+            float& sum_filter_dist,
             FuncAddCandidate func_add_candidate) {
         faiss::HNSWStats stats;
 
@@ -985,8 +1035,9 @@ struct v2_hnsw_jag_searcher {
                 // Early pruning: skip vector distance computation if filter distance alone
                 // exceeds the worst distance in the result set
                 // Inspired by JAG paper WeightJAG lines 422-427
-                // For binary filter: filter_dist = 1, so check if weight > worst_dist
-                if (should_prune_by_filter(1.0f, current_weight, worst_dist)) {
+                // Use normalized_h-adjusted weight for pruning decision
+                float effective_weight = current_weight * estimated_normalized_h;
+                if (should_prune_by_filter(1.0f, effective_weight, worst_dist)) {
                     early_pruned++;
                     continue;  // Skip computing vector distance
                 }
@@ -1022,10 +1073,18 @@ struct v2_hnsw_jag_searcher {
                     graph_visitor.visit_edge(
                             level, node_id, saved_indices[id4], dis[id4]);
 
-                    // JAG v3: Use combined distance with current (adaptive) weight
+                    // Track distances for normalized_h estimation
+                    // For binary filter: filter_dist = 0 (valid) or 1 (invalid)
+                    float filter_dist = saved_is_valid[id4] ? 0.0f : 1.0f;
+                    sum_vec_dist += std::fabs(dis[id4]);
+                    sum_filter_dist += filter_dist;
+
+                    // JAG v6: Use combined distance with normalized_h adjustment
+                    // Formula: combined = vec_dist + weight * normalized_h * filter_dist
                     // For valid nodes: combined = dis (no penalty)
-                    // For invalid nodes: combined = dis + current_weight (penalty)
-                    float combined = compute_combined_dist(dis[id4], !saved_is_valid[id4], current_weight);
+                    // For invalid nodes: combined = dis + weight * normalized_h
+                    float combined = compute_combined_dist_with_normalized_h(
+                            dis[id4], !saved_is_valid[id4], current_weight, estimated_normalized_h);
                     int status = saved_is_valid[id4] ? knowhere::Neighbor::kValid : knowhere::Neighbor::kInvalid;
                     knowhere::Neighbor nn(saved_indices[id4], combined, status);
                     func_add_candidate(nn);
@@ -1041,8 +1100,14 @@ struct v2_hnsw_jag_searcher {
 
             graph_visitor.visit_edge(level, node_id, saved_indices[id4], dis);
 
-            // JAG v3: Use combined distance with current (adaptive) weight
-            float combined = compute_combined_dist(dis, !saved_is_valid[id4], current_weight);
+            // Track distances for normalized_h estimation
+            float filter_dist = saved_is_valid[id4] ? 0.0f : 1.0f;
+            sum_vec_dist += std::fabs(dis);
+            sum_filter_dist += filter_dist;
+
+            // JAG v6: Use combined distance with normalized_h adjustment
+            float combined = compute_combined_dist_with_normalized_h(
+                    dis, !saved_is_valid[id4], current_weight, estimated_normalized_h);
             int status = saved_is_valid[id4] ? knowhere::Neighbor::kValid : knowhere::Neighbor::kInvalid;
             knowhere::Neighbor nn(saved_indices[id4], combined, status);
             func_add_candidate(nn);

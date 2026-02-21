@@ -188,10 +188,10 @@ inline bool should_prune_by_filter(float filter_dist, float current_weight, floa
 
 ### 8.1 中期优化 (1-2月)
 
-1. **实现 normalized_h**
-   - 建索引时采样计算
-   - 存储每个点的归一化因子
-   - 使权重设置更加通用
+1. ~~**实现 normalized_h**~~ ✅ 已实现在线估计版本
+   - 使用在线估计而非预计算
+   - 公式: `normalized_h = 0.1 * sum_vec_dist / sum_filter_dist`
+   - 无需额外存储，动态适应数据分布
 
 2. **支持 Range 过滤**
    - 实现 `RangeFilterDistance` 类
@@ -260,6 +260,7 @@ inline bool should_prune_by_filter(float filter_dist, float current_weight, floa
 | 自动权重选择 | ✅ 已实现 | `get_auto_weight_for_filter_ratio()` |
 | 早剪枝优化 | ✅ 已实现 | 减少不必要的向量距离计算 |
 | 默认权重优化 | ✅ 已完成 | 0.1 (优化低过滤率场景) |
+| normalized_h 在线估计 | ✅ 已实现 | 论文核心公式，无需预计算 |
 | Multi-Tier 搜索 | ⚠️ 已移除 | 复杂度不值得收益 |
 
 ---
@@ -272,6 +273,6 @@ inline bool should_prune_by_filter(float filter_dist, float current_weight, floa
 | 动态权重调整 | - | `HnswSearcher.h:get_adaptive_weight()` | ✅ |
 | 自动权重选择 | - | `HnswSearcher.h:get_auto_weight_for_filter_ratio()` | ✅ |
 | 早剪枝 | 论文 lines 422-427 | `HnswSearcher.h:should_prune_by_filter()` | ✅ |
-| normalized_h 计算 | `WeightJAG/index.h:init()` | 未实现 | ❌ |
+| normalized_h 计算 | `WeightJAG/index.h:init()` (预计算) | `HnswSearcher.h:estimate_normalized_h()` (在线) | ✅ |
 | Filter 距离 | `/Paper/JAG/parlayann/utils/filter_check.h` | `filter_distance.h` | ✅ |
 | Multi-Tier 配置 | `filtered_vector_search_benchmark_main.cc` | 未实现 | ❌ |
