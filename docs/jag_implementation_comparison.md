@@ -193,9 +193,10 @@ inline bool should_prune_by_filter(float filter_dist, float current_weight, floa
    - 公式: `normalized_h = 0.1 * sum_vec_dist / sum_filter_dist`
    - 无需额外存储，动态适应数据分布
 
-2. **支持 Range 过滤**
-   - 实现 `RangeFilterDistance` 类
-   - 距离 = 到范围边界的距离
+2. ~~**支持 Range 过滤**~~ ✅ 已实现基础版本
+   - 实现 `RangeFilterSet`, `RangeFilterConstraint`, `RangeFilterDistance`
+   - 距离 = 到范围边界的比例距离
+   - 范围内点距离=0，范围外点距离为到最近边界的距离
 
 ### 8.2 长期优化 (3-6月)
 
@@ -261,6 +262,7 @@ inline bool should_prune_by_filter(float filter_dist, float current_weight, floa
 | 早剪枝优化 | ✅ 已实现 | 减少不必要的向量距离计算 |
 | 默认权重优化 | ✅ 已完成 | 0.1 (优化低过滤率场景) |
 | normalized_h 在线估计 | ✅ 已实现 | 论文核心公式，无需预计算 |
+| Range 过滤支持 | ✅ 已实现 | 比例距离，支持边界检测 |
 | Multi-Tier 搜索 | ⚠️ 已移除 | 复杂度不值得收益 |
 
 ---
@@ -274,5 +276,6 @@ inline bool should_prune_by_filter(float filter_dist, float current_weight, floa
 | 自动权重选择 | - | `HnswSearcher.h:get_auto_weight_for_filter_ratio()` | ✅ |
 | 早剪枝 | 论文 lines 422-427 | `HnswSearcher.h:should_prune_by_filter()` | ✅ |
 | normalized_h 计算 | `WeightJAG/index.h:init()` (预计算) | `HnswSearcher.h:estimate_normalized_h()` (在线) | ✅ |
-| Filter 距离 | `/Paper/JAG/parlayann/utils/filter_check.h` | `filter_distance.h` | ✅ |
+| Label 过滤距离 | `/Paper/JAG/parlayann/utils/filter_check.h` | `filter_distance.h:LabelFilterDistance` | ✅ |
+| Range 过滤距离 | 论文 Section 3.2 | `filter_distance.h:RangeFilterDistance` | ✅ |
 | Multi-Tier 配置 | `filtered_vector_search_benchmark_main.cc` | 未实现 | ❌ |

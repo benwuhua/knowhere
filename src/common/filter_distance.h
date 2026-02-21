@@ -155,6 +155,191 @@ GenerateRandomLabels(int64_t num_points, int num_labels, int seed = 42) {
     return filter_set;
 }
 
+// ============================================================================
+// Range Filter Support (JAG paper Section 3.2)
+// ============================================================================
+
+// Range filter set - stores numeric values for all points
+// Used for filtering based on scalar attributes (e.g., price, timestamp, rating)
+struct RangeFilterSet {
+    std::vector<float> values;  // numeric value for each point
+    float min_val = 0.0f;       // minimum value in the dataset
+    float max_val = 0.0f;       // maximum value in the dataset
+
+    float
+    GetValue(int64_t id) const {
+        return values[id];
+    }
+
+    size_t
+    Size() const {
+        return values.size();
+    }
+
+    float
+    Range() const {
+        return max_val - min_val;
+    }
+
+    // Compute statistics for normalization
+    void
+    ComputeStats() {
+        if (values.empty()) {
+            return;
+        }
+        min_val = values[0];
+        max_val = values[0];
+        for (float v : values) {
+            if (v < min_val) min_val = v;
+            if (v > max_val) max_val = v;
+        }
+    }
+};
+
+// Range filter constraint for queries
+// Defines the acceptable range [low, high) for filtering
+struct RangeFilterConstraint {
+    float range_low;   // inclusive lower bound
+    float range_high;  // exclusive upper bound
+
+    // Calculate filter distance:
+    // - 0 if value is in range [low, high)
+    // - Proportional distance to nearest boundary if outside
+    // JAG paper: "distance to the range boundary"
+    float
+    Distance(float value) const {
+        if (value >= range_low && value < range_high) {
+            return 0.0f;  // Inside range
+        }
+        if (value < range_low) {
+            return range_low - value;  // Distance below range
+        }
+        return value - range_high;  // Distance above range
+    }
+
+    bool
+    Match(float value) const {
+        return value >= range_low && value < range_high;
+    }
+
+    // Get the width of the acceptable range
+    float
+    Width() const {
+        return range_high - range_low;
+    }
+};
+
+// Range filter distance implementation for JAG
+// Key difference from Label: distance is proportional, not binary
+class RangeFilterDistance : public FilterDistanceCalculator {
+ public:
+    RangeFilterDistance(const RangeFilterSet& filter_set, const RangeFilterConstraint& constraint,
+                        float normalization_scale = 0.0f)
+        : filter_set_(filter_set), constraint_(constraint) {
+        // Auto-compute normalization scale if not provided
+        if (normalization_scale > 0.0f) {
+            scale_ = normalization_scale;
+        } else {
+            // Use the data range as normalization scale
+            // This normalizes distances to [0, 1] range roughly
+            scale_ = filter_set_.Range();
+            if (scale_ < 1e-6f) {
+                scale_ = 1.0f;  // Avoid division by zero
+            }
+        }
+
+        // Pre-compute filter ratio
+        int64_t matches = 0;
+        for (int64_t i = 0; i < static_cast<int64_t>(filter_set_.Size()); i++) {
+            if (constraint_.Match(filter_set_.GetValue(i))) {
+                matches++;
+            }
+        }
+        filter_ratio_ = static_cast<float>(matches) / filter_set_.Size();
+    }
+
+    // Returns integer distance (scaled for JAG compatibility)
+    // 0 = in range, larger = further from range
+    int
+    Calculate(int64_t point_id) const override {
+        if (point_id < 0 || point_id >= static_cast<int64_t>(filter_set_.Size())) {
+            return 1;  // Invalid ID
+        }
+        float value = filter_set_.GetValue(point_id);
+
+        // Use Match() to determine if in range (not Distance())
+        // This handles boundary cases correctly
+        if (constraint_.Match(value)) {
+            return 0;  // In range
+        }
+
+        // Outside range - calculate proportional distance
+        float dist = constraint_.Distance(value);
+
+        // Normalize and convert to integer scale
+        // Scale to integer range [1, 1000] for reasonable weight interaction
+        int int_dist = static_cast<int>(dist / scale_ * 100.0f) + 1;
+        return int_dist;
+    }
+
+    bool
+    Match(int64_t point_id) const override {
+        if (point_id < 0 || point_id >= static_cast<int64_t>(filter_set_.Size())) {
+            return false;
+        }
+        return constraint_.Match(filter_set_.GetValue(point_id));
+    }
+
+    float
+    FilterRatio() const override {
+        return filter_ratio_;
+    }
+
+    float
+    GetRangeLow() const {
+        return constraint_.range_low;
+    }
+
+    float
+    GetRangeHigh() const {
+        return constraint_.range_high;
+    }
+
+    float
+    GetScale() const {
+        return scale_;
+    }
+
+ private:
+    const RangeFilterSet& filter_set_;
+    RangeFilterConstraint constraint_;
+    float scale_;
+    float filter_ratio_;
+};
+
+// Helper function to generate random range values for testing
+inline RangeFilterSet
+GenerateRandomRangeValues(int64_t num_points, float min_val = 0.0f, float max_val = 100.0f, int seed = 42) {
+    RangeFilterSet filter_set;
+    filter_set.values.resize(num_points);
+    filter_set.min_val = min_val;
+    filter_set.max_val = max_val;
+
+    // Simple deterministic random number generator
+    uint64_t state = seed;
+    auto next_random = [&state]() {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        return static_cast<float>((state >> 33) & 0x7FFFFFFF) / 0x7FFFFFFF;
+    };
+
+    float range = max_val - min_val;
+    for (int64_t i = 0; i < num_points; i++) {
+        filter_set.values[i] = min_val + next_random() * range;
+    }
+
+    return filter_set;
+}
+
 }  // namespace knowhere
 
 #endif  // KNOWHERE_COMMON_FILTER_DISTANCE_H_
