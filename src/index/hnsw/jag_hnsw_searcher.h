@@ -16,10 +16,8 @@
 #define KNOWHERE_INDEX_HNSW_JAG_HNSW_SEARCHER_H_
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
-#include <functional>
-#include <queue>
+#include <limits>
 #include <unordered_set>
 #include <vector>
 
@@ -80,11 +78,18 @@ class JagHnswSearcher {
     Search(const HnswIndex& index, const float* query, int k,
            const FilterDistanceCalculator& filter_calc, const DistanceFunc& dist_func,
            const Config& config, Metrics* metrics = nullptr) {
-        std::vector<SearchResult> results;
-        results.reserve(k);
-
-        std::priority_queue<SearchState> frontier;
+        // Use vector-backed min-heap so we can scan all elements for the worst.
+        // SearchState::operator< is inverted (a < b ↔ a.combined > b.combined),
+        // so std::make/push/pop_heap give min-heap semantics: front() = best.
+        std::vector<SearchState> frontier;
+        frontier.reserve(config.beam_width * 2 + 1);
         std::unordered_set<int64_t> visited;
+
+        // All valid candidates found; sorted and truncated to k at the end.
+        // This mirrors the ef_search approach: explore fully, then pick top-k
+        // by vector distance. Stopping early (results.size() >= k) was the bug:
+        // the first k valid nodes found are not necessarily the k nearest ones.
+        std::vector<SearchResult> all_candidates;
 
         // Initialize metrics
         Metrics local_metrics;
@@ -93,7 +98,7 @@ class JagHnswSearcher {
         // Get entry point
         int64_t entry_point = GetEntryPoint(index);
         if (entry_point < 0) {
-            return results;  // Empty index
+            return {};
         }
 
         // Initialize with entry point
@@ -104,15 +109,21 @@ class JagHnswSearcher {
             m->distance_computations++;
             m->filter_checks++;
 
-            frontier.push({entry_point, entry_dist, entry_filter,
-                           entry_dist + config.filter_weight * entry_filter});
+            frontier.push_back({entry_point, entry_dist, entry_filter,
+                                 entry_dist + config.filter_weight * entry_filter});
+            std::push_heap(frontier.begin(), frontier.end());
         }
 
-        // Main search loop
-        while (!frontier.empty() && static_cast<int>(results.size()) < k &&
+        // Main search loop: explore until frontier is empty or budget is exhausted.
+        // Do NOT terminate early on all_candidates.size() >= k — that is what
+        // caused the recall bug. We collect all reachable valid nodes and pick
+        // the best k afterwards.
+        while (!frontier.empty() &&
                static_cast<int>(visited.size()) < config.max_visits) {
-            SearchState current = frontier.top();
-            frontier.pop();
+            // Pop best candidate (minimum combined distance)
+            std::pop_heap(frontier.begin(), frontier.end());
+            SearchState current = frontier.back();
+            frontier.pop_back();
 
             // Skip if already visited
             if (visited.count(current.node_id)) {
@@ -121,15 +132,10 @@ class JagHnswSearcher {
             visited.insert(current.node_id);
             m->nodes_visited++;
 
-            // If filter matches, add to results
+            // Collect valid candidates; keep exploring regardless
             if (current.filter_dist == 0) {
-                results.push_back({current.node_id, current.vector_dist});
+                all_candidates.push_back({current.node_id, current.vector_dist});
                 m->valid_visits++;
-
-                // Stop if we have enough results
-                if (static_cast<int>(results.size()) >= k) {
-                    break;
-                }
             }
 
             // Expand neighbors
@@ -143,18 +149,14 @@ class JagHnswSearcher {
                 int filter_dist = filter_calc.Calculate(neighbor);
                 m->filter_checks++;
 
-                // Early pruning based on filter distance alone
-                if (frontier.size() >= static_cast<size_t>(config.beam_width)) {
-                    // If frontier is full and this node has high filter distance,
-                    // it's unlikely to be useful
-                    if (filter_dist > 0 &&
-                        config.filter_weight > 0 &&
-                        frontier.size() > 0) {
-                        // Get approximate threshold from current worst in frontier
-                        DistanceType worst_combined = GetWorstCombinedDistance(frontier);
-                        if (config.filter_weight * filter_dist > worst_combined) {
-                            continue;  // Prune this neighbor
-                        }
+                // Early pruning based on filter distance alone:
+                // if even the best possible vector distance (0) still exceeds
+                // the worst combined distance in the frontier, skip.
+                if (frontier.size() >= static_cast<size_t>(config.beam_width) &&
+                    filter_dist > 0 && config.filter_weight > 0) {
+                    DistanceType worst_combined = GetWorstCombinedDistance(frontier);
+                    if (config.filter_weight * filter_dist > worst_combined) {
+                        continue;  // Prune this neighbor
                     }
                 }
 
@@ -164,39 +166,35 @@ class JagHnswSearcher {
 
                 DistanceType combined = dist + config.filter_weight * filter_dist;
 
-                // Check if this should be added to frontier
+                // Add to frontier if it has room or beats the current worst
                 if (static_cast<int>(frontier.size()) < config.beam_width ||
                     combined < GetWorstCombinedDistance(frontier)) {
-                    frontier.push({neighbor, dist, filter_dist, combined});
+                    frontier.push_back({neighbor, dist, filter_dist, combined});
+                    std::push_heap(frontier.begin(), frontier.end());
 
-                    // Keep frontier size bounded
-                    while (static_cast<int>(frontier.size()) > config.beam_width * 2) {
-                        // Remove worst elements (approximate - just pop one)
-                        std::priority_queue<SearchState> temp;
-                        int keep = config.beam_width;
-                        while (!frontier.empty() && keep > 0) {
-                            temp.push(frontier.top());
-                            frontier.pop();
-                            keep--;
-                        }
-                        frontier = std::move(temp);
+                    // Keep frontier size bounded: discard the worst candidates
+                    if (static_cast<int>(frontier.size()) > config.beam_width * 2) {
+                        // Sort ascending by combined_dist; best (lowest) first
+                        std::sort(frontier.begin(), frontier.end(),
+                                  [](const SearchState& a, const SearchState& b) {
+                                      return a.combined_dist < b.combined_dist;
+                                  });
+                        frontier.resize(config.beam_width);
+                        std::make_heap(frontier.begin(), frontier.end());
                     }
                 }
             }
         }
 
-        // Sort results by distance
-        std::sort(results.begin(), results.end(),
+        // Sort all valid candidates by vector distance, return top-k
+        std::sort(all_candidates.begin(), all_candidates.end(),
                   [](const SearchResult& a, const SearchResult& b) {
                       return a.second < b.second;
                   });
-
-        // Keep only top-k
-        if (static_cast<int>(results.size()) > k) {
-            results.resize(k);
+        if (static_cast<int>(all_candidates.size()) > k) {
+            all_candidates.resize(k);
         }
-
-        return results;
+        return all_candidates;
     }
 
     // Baseline search: standard HNSW + post-filter
@@ -209,7 +207,8 @@ class JagHnswSearcher {
         std::vector<SearchResult> results;
         results.reserve(k);
 
-        std::priority_queue<SearchState> frontier;
+        std::vector<SearchState> frontier;
+        frontier.reserve(config.ef_search + 1);
         std::unordered_set<int64_t> visited;
 
         Metrics local_metrics;
@@ -225,7 +224,8 @@ class JagHnswSearcher {
             DistanceType entry_dist = dist_func(query, entry_point);
             m->distance_computations++;
 
-            frontier.push({entry_point, entry_dist, 0, entry_dist});
+            frontier.push_back({entry_point, entry_dist, 0, entry_dist});
+            std::push_heap(frontier.begin(), frontier.end());
         }
 
         // Track all candidates (not just matched ones)
@@ -233,8 +233,9 @@ class JagHnswSearcher {
         all_candidates.reserve(config.ef_search * 2);
 
         while (!frontier.empty() && static_cast<int>(visited.size()) < config.max_visits) {
-            SearchState current = frontier.top();
-            frontier.pop();
+            std::pop_heap(frontier.begin(), frontier.end());
+            SearchState current = frontier.back();
+            frontier.pop_back();
 
             if (visited.count(current.node_id)) {
                 continue;
@@ -263,7 +264,8 @@ class JagHnswSearcher {
 
                 if (static_cast<int>(frontier.size()) < config.ef_search ||
                     dist < GetWorstDistance(frontier)) {
-                    frontier.push({neighbor, dist, 0, dist});
+                    frontier.push_back({neighbor, dist, 0, dist});
+                    std::push_heap(frontier.begin(), frontier.end());
                 }
             }
         }
@@ -286,8 +288,6 @@ class JagHnswSearcher {
     template <typename HnswIndex>
     int64_t
     GetEntryPoint(const HnswIndex& index) const {
-        // Adapt based on actual HNSW implementation
-        // For faiss::IndexHNSW, entry point is typically at max_level
         if (index.ntotal == 0) {
             return -1;
         }
@@ -300,8 +300,6 @@ class JagHnswSearcher {
     GetNeighbors(const HnswIndex& index, int64_t node_id) const {
         std::vector<int64_t> neighbors;
 
-        // For faiss::IndexHNSW, access through hnsw structure
-        // This needs to be adapted based on the actual HNSW implementation
         const auto& hnsw = index.hnsw;
         int level = 0;  // Use level 0 for search
 
@@ -318,26 +316,35 @@ class JagHnswSearcher {
         return neighbors;
     }
 
-    // Get worst (highest) combined distance in frontier
+    // Get worst (highest) combined distance in frontier.
+    // O(n) scan over the vector — acceptable since frontier is bounded to beam_width*2.
     DistanceType
-    GetWorstCombinedDistance(const std::priority_queue<SearchState>& frontier) const {
+    GetWorstCombinedDistance(const std::vector<SearchState>& frontier) const {
         if (frontier.empty()) {
             return std::numeric_limits<DistanceType>::max();
         }
-        // Priority queue is a min-heap, so we need to scan
-        // This is expensive, so use sparingly
-        // For simplicity, return the top (minimum) * -1 as approximation
-        // A better approach would track max separately
-        return frontier.top().combined_dist * 2;  // Rough approximation
+        DistanceType worst = std::numeric_limits<DistanceType>::lowest();
+        for (const auto& s : frontier) {
+            if (s.combined_dist > worst) {
+                worst = s.combined_dist;
+            }
+        }
+        return worst;
     }
 
-    // Get worst (highest) vector distance in frontier
+    // Get worst (highest) vector distance in frontier.
     DistanceType
-    GetWorstDistance(const std::priority_queue<SearchState>& frontier) const {
+    GetWorstDistance(const std::vector<SearchState>& frontier) const {
         if (frontier.empty()) {
             return std::numeric_limits<DistanceType>::max();
         }
-        return frontier.top().vector_dist * 2;  // Rough approximation
+        DistanceType worst = std::numeric_limits<DistanceType>::lowest();
+        for (const auto& s : frontier) {
+            if (s.vector_dist > worst) {
+                worst = s.vector_dist;
+            }
+        }
+        return worst;
     }
 };
 

@@ -1233,6 +1233,10 @@ namespace diskann {
     filtered_nbrs.reserve(this->max_degree);
     filtered_nbrs_is_valid.reserve(this->max_degree);
 
+    // JAG: Track PQ distance statistics for adaptive weight calculation
+    float pq_dist_estimate = 0.0f;  // Will track average PQ distance seen
+    int pq_dist_count = 0;
+
     auto filter_nbrs = [&](_u64      nnbrs,
                            unsigned *node_nbrs) -> std::pair<_u64, unsigned *> {
       filtered_nbrs.clear();
@@ -1300,7 +1304,11 @@ namespace diskann {
               this->node_visit_counter[retset[marker].id].second->fetch_add(1);
             }
           }
-          if (!bitset_view.empty() && bitset_view.test(retset[marker].id)) {
+          // JAG improvement: Don't remove invalid nodes during navigation
+          // Let them participate in graph traversal to find valid neighbors
+          // Final filtering happens when building the result set
+          if (!enable_jag && !bitset_view.empty() && bitset_view.test(retset[marker].id)) {
+            // Original behavior: remove invalid nodes from retset
             std::memmove(&retset[marker], &retset[marker + 1],
                          (cur_list_size - marker - 1) * sizeof(Neighbor));
             cur_list_size--;
@@ -1392,10 +1400,31 @@ namespace diskann {
             stats->n_cmps++;
           }
 
-          // JAG: Use combined distance for ranking invalid nodes
+          // JAG: Adaptive combined distance for ranking
+          // Key improvement: use adaptive weight based on observed PQ distances
           float ranking_dist = dist;
           if (enable_jag && !is_valid) {
-            ranking_dist = dist + jag_filter_weight;
+            // Update running estimate of PQ distance statistics
+            pq_dist_estimate += dist;
+            pq_dist_count++;
+
+            // Compute adaptive weight: scale by average PQ distance seen so far
+            // This ensures filter penalty is proportional to vector distances
+            float avg_pq_dist = (pq_dist_count > 0) ?
+                                (pq_dist_estimate / pq_dist_count) : 1.0f;
+
+            // Adaptive weight: use user-provided weight scaled by sqrt(avg_dist)
+            // sqrt() provides gentler scaling than linear, avoiding over-penalization
+            // jag_filter_weight=0.1 with avg_dist=4 -> effective penalty ≈ 0.2
+            float adaptive_weight = jag_filter_weight;
+            if (avg_pq_dist > 0.001f) {
+              // Use sqrt for gentler scaling
+              adaptive_weight = jag_filter_weight * std::sqrt(avg_pq_dist);
+            }
+
+            // Combined distance: vector_dist + adaptive_weight * filter_dist
+            // filter_dist = 1.0 for invalid nodes (binary: valid or not)
+            ranking_dist = dist + adaptive_weight;
           }
 
           if (cur_list_size > 0 && ranking_dist >= retset[cur_list_size - 1].distance &&

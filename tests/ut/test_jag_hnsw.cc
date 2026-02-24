@@ -230,9 +230,6 @@ SearchJAG(const SimpleTestGraph& graph, const float* base_data, const float* que
     // Collect all visited nodes as candidates (not just matches)
     std::vector<std::pair<float, int64_t>> candidates;  // (vec_dist, node_id)
 
-    // Track matching candidates for early stopping
-    std::vector<float> matching_distances;  // vec_dist of matching nodes
-
     auto combined_dist = [&](float vec_dist, int64_t node_id) {
         int filter_dist = (filter_set.GetLabel(node_id) == target_label) ? 0 : 1;
         return vec_dist + filter_weight * filter_dist;
@@ -242,10 +239,12 @@ SearchJAG(const SimpleTestGraph& graph, const float* base_data, const float* que
     float entry_vec_dist = L2DistanceSq(query, base_data + entry * graph.dim, graph.dim);
     frontier.push({-combined_dist(entry_vec_dist, entry), entry});
 
-    // Phase 1: Search with combined_dist, collect ALL nodes into candidates
-    // Early stopping when we have enough matching candidates and frontier is exhausted
-    int min_matches_for_early_stop = k * 20;  // Need enough matches for high recall
-
+    // Phase 1: Search with combined_dist, collect ALL visited nodes into candidates.
+    // No early stopping here: the "early stop when k*20 matches found" heuristic
+    // only works on proximity graphs (e.g. real HNSW) where frontier ordering
+    // approximates distance ordering. On a random graph the frontier can still
+    // lead to closer nodes even after many matches are found, so we must exhaust
+    // max_visits to guarantee correct recall.
     while (!frontier.empty() && result.nodes_visited < max_visits) {
         auto [neg_combined, current] = frontier.top();
         frontier.pop();
@@ -260,25 +259,6 @@ SearchJAG(const SimpleTestGraph& graph, const float* base_data, const float* que
 
         if (filter_set.GetLabel(current) == target_label) {
             result.valid_visits++;
-            matching_distances.push_back(vec_dist);
-        }
-
-        // Early stopping: if we have enough matches and the frontier's best combined dist
-        // is larger than the k-th best match's vec_dist, we can stop
-        if (static_cast<int>(matching_distances.size()) >= min_matches_for_early_stop) {
-            // Sort matching distances to find k-th best
-            std::sort(matching_distances.begin(), matching_distances.end());
-            float kth_best_match_dist = matching_distances[std::min(k-1, (int)matching_distances.size()-1)];
-
-            // Check if frontier's best is worse than k-th best match
-            // (Note: frontier stores -combined_dist, so we negate to get actual value)
-            float frontier_best_combined = -frontier.top().first;
-
-            // If the best remaining in frontier (combined dist) is worse than k-th best match (vec dist)
-            // plus a margin, we can safely stop
-            if (!frontier.empty() && frontier_best_combined > kth_best_match_dist + filter_weight) {
-                break;
-            }
         }
 
         for (int64_t neighbor : graph.nodes[current].neighbors) {
@@ -483,9 +463,6 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
     // This allows us to find the globally best matches after search completes
     std::vector<std::pair<float, int64_t>> candidates;  // (vec_dist, node_id)
 
-    // Track matching candidates for early stopping
-    std::vector<float> matching_distances;  // vec_dist of matching nodes
-
     // Combined distance function - used to guide search direction
     auto combined_dist = [&](float vec_dist, int64_t node_id) {
         int filter_dist = (filter_set.GetLabel(node_id) == target_label) ? 0 : 1;
@@ -501,11 +478,11 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
     float entry_vec_dist = graph.ComputeDistance(query, entry);
     frontier.push({-combined_dist(entry_vec_dist, entry), entry});
 
-    // Phase 1: Search with combined_dist to guide direction
-    // Collect ALL nodes into candidate pool (not just matches)
-    // Early stopping when we have enough matching candidates
-    int min_matches_for_early_stop = k * 20;  // Need enough matches for high recall
-
+    // Phase 1: Search with combined_dist to guide direction.
+    // Collect ALL visited nodes into candidate pool (not just matches).
+    // No early stopping: "stop when k*20 matches seen" only holds on proximity
+    // graphs where the frontier ordering approximates distance ordering. We
+    // instead rely on max_visits to control the exploration budget.
     while (!frontier.empty() && result.nodes_visited < max_visits) {
         auto [neg_combined, current] = frontier.top();
         frontier.pop();
@@ -521,24 +498,6 @@ SearchJAGReal(const RealHNSWGraph& graph, const float* query, int k,
         // Track valid visits for metrics
         if (filter_set.GetLabel(current) == target_label) {
             result.valid_visits++;
-            matching_distances.push_back(vec_dist);
-        }
-
-        // Early stopping: if we have enough matches and the frontier's best combined dist
-        // is larger than the k-th best match's vec_dist, we can stop
-        if (static_cast<int>(matching_distances.size()) >= min_matches_for_early_stop) {
-            // Sort matching distances to find k-th best
-            std::sort(matching_distances.begin(), matching_distances.end());
-            float kth_best_match_dist = matching_distances[std::min(k-1, (int)matching_distances.size()-1)];
-
-            // Check if frontier's best is worse than k-th best match
-            float frontier_best_combined = -frontier.top().first;
-
-            // If the best remaining in frontier (combined dist) is worse than k-th best match (vec dist)
-            // plus a margin, we can safely stop
-            if (!frontier.empty() && frontier_best_combined > kth_best_match_dist + filter_weight) {
-                break;
-            }
         }
 
         // Explore neighbors using combined_dist for prioritization

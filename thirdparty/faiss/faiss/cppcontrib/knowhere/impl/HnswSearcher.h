@@ -713,21 +713,35 @@ struct v2_hnsw_jag_searcher {
         }
     }
 
-    // Online estimation of normalized_h factor (inspired by JAG paper)
-    // The paper uses: normalized_h[p] = std_vec_dist / std_filter_dist for each point
-    // RWalksVamana variant uses a global: normalized_h = 0.1 * avg_vec_dist / avg_filter_dist
-    // Here we estimate it online from observed distances during search
-    // This avoids O(n) storage and O(n*100) precomputation cost
+    // Online estimation of normalized_h factor (JAG paper WeightJAG formula)
+    // Paper formula: normalized_h[p] = std(vec_dist) / std(filter_dist)
+    // For binary filter (0/1 values): std_filter = sqrt(p * (1-p)) is analytical,
+    // where p = observed fraction of invalid nodes.
+    // std_vec is estimated online using Welford's online variance formula.
+    // This avoids O(n) storage and O(n*100) precomputation cost.
     inline float
-    estimate_normalized_h(float sum_vec_dist, float sum_filter_dist, int sample_count) const {
-        if (sample_count < 10 || sum_filter_dist < 0.001f) {
-            return 1.0f;  // Default fallback
+    estimate_normalized_h(
+            float sum_vec_dist,
+            float sum_sq_vec_dist,
+            float sum_filter_dist,
+            int sample_count) const {
+        if (sample_count < 10) {
+            return 1.0f;  // Default fallback before enough samples
         }
-        // Use ratio of sums (equivalent to ratio of averages)
-        float raw_ratio = sum_vec_dist / sum_filter_dist;
-        // Apply scaling factor of 0.1 as suggested by RWalksVamana
-        // This prevents over-weighting filter distance
-        return 0.1f * raw_ratio;
+        // Binary filter std: p = mean filter_dist = fraction of invalid nodes
+        float p = sum_filter_dist / static_cast<float>(sample_count);
+        // Clamp to valid range to avoid degenerate cases (all valid or all invalid)
+        p = std::max(0.001f, std::min(0.999f, p));
+        float std_filter = std::sqrt(p * (1.0f - p));
+
+        // Vector distance std using E[x^2] - E[x]^2
+        float mean_vec = sum_vec_dist / static_cast<float>(sample_count);
+        float mean_sq_vec = sum_sq_vec_dist / static_cast<float>(sample_count);
+        float var_vec = mean_sq_vec - mean_vec * mean_vec;
+        var_vec = std::max(0.0f, var_vec);  // Numerical safety for floating point
+        float std_vec = std::sqrt(var_vec);
+
+        return std_vec / std_filter;
     }
 
     // Early pruning check - with high safety margin for high recall
@@ -910,10 +924,12 @@ struct v2_hnsw_jag_searcher {
         int invalid_nodes_seen = 0;
         float current_weight = base_filter_weight;
 
-        // Track normalized_h estimation (online estimation from observed distances)
-        // Inspired by JAG paper: normalized_h = std_vec_dist / std_filter_dist
-        // We use: normalized_h = 0.1 * sum_vec_dist / sum_filter_dist
+        // Track normalized_h estimation using JAG paper formula:
+        //   normalized_h = std(vec_dist) / std(filter_dist)
+        // For binary filter: std_filter = sqrt(p*(1-p)) is analytical from observed invalid ratio.
+        // std_vec is estimated online via sum and sum-of-squares.
         float sum_vec_dist = 0.0f;
+        float sum_sq_vec_dist = 0.0f;
         float sum_filter_dist = 0.0f;
         float estimated_normalized_h = 1.0f;  // Default fallback
 
@@ -931,9 +947,11 @@ struct v2_hnsw_jag_searcher {
                 current_weight = get_adaptive_weight(total_nodes_seen, invalid_nodes_seen);
             }
 
-            // Update normalized_h estimation periodically
+            // Update normalized_h estimation periodically using paper formula:
+            //   normalized_h = std(vec_dist) / std(filter_dist)
             if (total_nodes_seen > 0 && total_nodes_seen % 50 == 0) {
-                estimated_normalized_h = estimate_normalized_h(sum_vec_dist, sum_filter_dist, total_nodes_seen);
+                estimated_normalized_h = estimate_normalized_h(
+                        sum_vec_dist, sum_sq_vec_dist, sum_filter_dist, total_nodes_seen);
             }
 
             // Get worst distance in result set for early pruning
@@ -949,6 +967,7 @@ struct v2_hnsw_jag_searcher {
                     total_nodes_seen,
                     invalid_nodes_seen,
                     sum_vec_dist,
+                    sum_sq_vec_dist,
                     sum_filter_dist,
                     add_search_candidate);
 
@@ -998,6 +1017,7 @@ struct v2_hnsw_jag_searcher {
             int& total_nodes_seen,
             int& invalid_nodes_seen,
             float& sum_vec_dist,
+            float& sum_sq_vec_dist,
             float& sum_filter_dist,
             FuncAddCandidate func_add_candidate) {
         faiss::HNSWStats stats;
@@ -1077,6 +1097,7 @@ struct v2_hnsw_jag_searcher {
                     // For binary filter: filter_dist = 0 (valid) or 1 (invalid)
                     float filter_dist = saved_is_valid[id4] ? 0.0f : 1.0f;
                     sum_vec_dist += std::fabs(dis[id4]);
+                    sum_sq_vec_dist += dis[id4] * dis[id4];
                     sum_filter_dist += filter_dist;
 
                     // JAG v6: Use combined distance with normalized_h adjustment
@@ -1103,6 +1124,7 @@ struct v2_hnsw_jag_searcher {
             // Track distances for normalized_h estimation
             float filter_dist = saved_is_valid[id4] ? 0.0f : 1.0f;
             sum_vec_dist += std::fabs(dis);
+            sum_sq_vec_dist += dis * dis;
             sum_filter_dist += filter_dist;
 
             // JAG v6: Use combined distance with normalized_h adjustment
