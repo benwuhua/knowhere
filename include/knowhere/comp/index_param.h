@@ -178,6 +178,11 @@ constexpr const char* HNSW_M = "M";
 constexpr const char* EF = "ef";
 constexpr const char* OVERVIEW_LEVELS = "overview_levels";
 
+// JAG-HNSW Params (filter-guided graph traversal)
+constexpr const char* ENABLE_JAG = "enable_jag";
+constexpr const char* JAG_FILTER_WEIGHT = "jag_filter_weight";
+constexpr const char* JAG_CANDIDATE_POOL_SIZE = "jag_candidate_pool_size";
+
 // DISKANN Params
 constexpr const char* MAX_DEGREE = "max_degree";
 constexpr const char* PQ_CODE_BUDGET_GB = "pq_code_budget_gb";

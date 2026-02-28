@@ -1088,7 +1088,8 @@ namespace diskann {
       const T *query1, const _u64 k_search, const _u64 l_search, _s64 *indices,
       float *distances, const _u64 beam_width, const bool use_reorder_data,
       QueryStats *stats, const knowhere::feder::diskann::FederResultUniq &feder,
-      knowhere::BitsetView bitset_view, const float filter_ratio_in) {
+      knowhere::BitsetView bitset_view, const float filter_ratio_in,
+      const bool enable_jag, const float jag_filter_weight) {
     if (beam_width > defaults::MAX_N_SECTOR_READS)
       throw ANNException("Beamwidth can not be higher than MAX_N_SECTOR_READS",
                          -1, __FUNCSIG__, __FILE__, __LINE__);
@@ -1228,25 +1229,41 @@ namespace diskann {
 
     float                 accumulative_alpha = 0;
     std::vector<unsigned> filtered_nbrs;
+    std::vector<bool>     filtered_nbrs_is_valid;  // Track valid/invalid status for JAG
     filtered_nbrs.reserve(this->max_degree);
+    filtered_nbrs_is_valid.reserve(this->max_degree);
+
+    // JAG: Track PQ distance statistics for adaptive weight calculation
+    float pq_dist_estimate = 0.0f;  // Will track average PQ distance seen
+    int pq_dist_count = 0;
+
     auto filter_nbrs = [&](_u64      nnbrs,
                            unsigned *node_nbrs) -> std::pair<_u64, unsigned *> {
       filtered_nbrs.clear();
+      filtered_nbrs_is_valid.clear();
       for (_u64 m = 0; m < nnbrs; ++m) {
         unsigned id = node_nbrs[m];
         if (visited.find(id) != visited.end()) {
           continue;
         }
         visited.insert(id);
-        if (!bitset_view.empty() && bitset_view.test(id)) {
-          accumulative_alpha += kAlpha;
-          if (accumulative_alpha < 1.0f) {
-            continue;
+        bool is_valid = bitset_view.empty() || !bitset_view.test(id);
+        if (!is_valid) {
+          if (enable_jag) {
+            // JAG: Skip Alpha mechanism, allow all invalid nodes for navigation
+            // The ranking will deprioritize them via combined distance
+          } else {
+            // Original Alpha mechanism
+            accumulative_alpha += kAlpha;
+            if (accumulative_alpha < 1.0f) {
+              continue;
+            }
+            accumulative_alpha -= 1.0f;
           }
-          accumulative_alpha -= 1.0f;
         }
         cmps++;
         filtered_nbrs.push_back(id);
+        filtered_nbrs_is_valid.push_back(is_valid);
       }
       return {filtered_nbrs.size(), filtered_nbrs.data()};
     };
@@ -1287,7 +1304,11 @@ namespace diskann {
               this->node_visit_counter[retset[marker].id].second->fetch_add(1);
             }
           }
-          if (!bitset_view.empty() && bitset_view.test(retset[marker].id)) {
+          // JAG improvement: Don't remove invalid nodes during navigation
+          // Let them participate in graph traversal to find valid neighbors
+          // Final filtering happens when building the result set
+          if (!enable_jag && !bitset_view.empty() && bitset_view.test(retset[marker].id)) {
+            // Original behavior: remove invalid nodes from retset
             std::memmove(&retset[marker], &retset[marker + 1],
                          (cur_list_size - marker - 1) * sizeof(Neighbor));
             cur_list_size--;
@@ -1365,6 +1386,7 @@ namespace diskann {
         // process prefetched nhood
         for (_u64 m = 0; m < nnbrs; ++m) {
           unsigned id = node_nbrs[m];
+          bool is_valid = filtered_nbrs_is_valid[m];
 
           // add neighbor info into feder result
           if (feder != nullptr) {
@@ -1377,10 +1399,38 @@ namespace diskann {
           if (stats != nullptr) {
             stats->n_cmps++;
           }
-          if (cur_list_size > 0 && dist >= retset[cur_list_size - 1].distance &&
+
+          // JAG: Adaptive combined distance for ranking
+          // Key improvement: use adaptive weight based on observed PQ distances
+          float ranking_dist = dist;
+          if (enable_jag && !is_valid) {
+            // Update running estimate of PQ distance statistics
+            pq_dist_estimate += dist;
+            pq_dist_count++;
+
+            // Compute adaptive weight: scale by average PQ distance seen so far
+            // This ensures filter penalty is proportional to vector distances
+            float avg_pq_dist = (pq_dist_count > 0) ?
+                                (pq_dist_estimate / pq_dist_count) : 1.0f;
+
+            // Adaptive weight: use user-provided weight scaled by sqrt(avg_dist)
+            // sqrt() provides gentler scaling than linear, avoiding over-penalization
+            // jag_filter_weight=0.1 with avg_dist=4 -> effective penalty ≈ 0.2
+            float adaptive_weight = jag_filter_weight;
+            if (avg_pq_dist > 0.001f) {
+              // Use sqrt for gentler scaling
+              adaptive_weight = jag_filter_weight * std::sqrt(avg_pq_dist);
+            }
+
+            // Combined distance: vector_dist + adaptive_weight * filter_dist
+            // filter_dist = 1.0 for invalid nodes (binary: valid or not)
+            ranking_dist = dist + adaptive_weight;
+          }
+
+          if (cur_list_size > 0 && ranking_dist >= retset[cur_list_size - 1].distance &&
               (cur_list_size == l_search))
             continue;
-          Neighbor nn(id, dist, true);
+          Neighbor nn(id, ranking_dist, true);
           // Return position in sorted list where nn inserted.
           auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
           if (cur_list_size < l_search)

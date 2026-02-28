@@ -178,14 +178,25 @@ endif()
 if(WITH_DISKANN)
   add_definitions(-DKNOWHERE_WITH_DISKANN)
   include(cmake/libs/libdiskann.cmake)
-  # PageANN depends on DiskANN
-  if(WITH_PAGEANN)
-    add_definitions(-DKNOWHERE_WITH_PAGEANN)
-    message(STATUS "Building with PageANN optimizations")
-  endif()
-else()
+endif()
+
+if(WITH_PAGEANN)
+  add_definitions(-DKNOWHERE_WITH_PAGEANN)
+  include(cmake/libs/libpageann.cmake)
+  message(STATUS "Building with PageANN (Paper: page-level graph index)")
+endif()
+
+if(NOT WITH_DISKANN AND NOT WITH_PAGEANN)
   knowhere_file_glob(GLOB_RECURSE KNOWHERE_DISKANN_SRCS src/index/diskann/*.cc)
   list(REMOVE_ITEM KNOWHERE_SRCS ${KNOWHERE_DISKANN_SRCS})
+elseif(NOT WITH_DISKANN)
+  # Only PageANN enabled: exclude diskann.cc but keep pageann.cc
+  knowhere_file_glob(GLOB KNOWHERE_DISKANN_ONLY_SRCS src/index/diskann/diskann.cc src/index/diskann/diskann_aisaq.cc)
+  list(REMOVE_ITEM KNOWHERE_SRCS ${KNOWHERE_DISKANN_ONLY_SRCS})
+elseif(NOT WITH_PAGEANN)
+  # Only DiskANN enabled: exclude pageann.cc
+  knowhere_file_glob(GLOB KNOWHERE_PAGEANN_ONLY_SRCS src/index/diskann/pageann.cc)
+  list(REMOVE_ITEM KNOWHERE_SRCS ${KNOWHERE_PAGEANN_ONLY_SRCS})
 endif()
 
 knowhere_file_glob(GLOB_RECURSE KNOWHERE_GPU_SRCS src/index/gpu/flat_gpu/*.cc
@@ -209,6 +220,7 @@ list(APPEND KNOWHERE_LINKER_LIBS prometheus-cpp::core prometheus-cpp::push)
 list(APPEND KNOWHERE_LINKER_LIBS fmt::fmt-header-only)
 list(APPEND KNOWHERE_LINKER_LIBS Folly::folly)
 list(APPEND KNOWHERE_LINKER_LIBS milvus-common)
+list(APPEND KNOWHERE_LINKER_LIBS opentelemetry-cpp::opentelemetry_exporter_jaeger_trace)
 list(APPEND KNOWHERE_LINKER_LIBS simde::simde)
 
 add_library(knowhere SHARED ${KNOWHERE_SRCS})

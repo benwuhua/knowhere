@@ -95,10 +95,8 @@ class KnowhereConan(ConanFile):
     def configure(self):
         if self.options.shared:
             self.options.rm_safe("fPIC")
-        # PageANN requires DiskANN
-        if self.options.get_safe("with_pageann") and not self.options.with_diskann:
-            self.output.warn("PageANN requires DiskANN. Enabling with_diskann.")
-            self.options.with_diskann = True
+        # PageANN is now independent of DiskANN (uses its own thirdparty/PageANN)
+        # Both can be enabled simultaneously for A/B comparison
 
     def requirements(self):
         self.requires("boost/[>=1.82.0]", transitive_headers=True, transitive_libs=True)

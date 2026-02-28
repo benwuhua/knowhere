@@ -90,6 +90,10 @@ TEST_CASE("PageANN - Basic functionality test", "[pageann]") {
         json["data_path"] = kRawDataPath;
         json["max_degree"] = 56;
         json["search_list_size"] = 128;
+        // DiskANN memory budget parameters
+        json["pq_code_budget_gb"] = 0.05f;
+        json["search_cache_budget_gb"] = 0.01f;
+        json["build_dram_budget_gb"] = 0.2f;
         return json;
     };
 
@@ -150,6 +154,7 @@ TEST_CASE("PageANN - Basic functionality test", "[pageann]") {
             search_json["index_prefix"] = kL2IndexPrefix;
             search_json["search_list_size"] = 64;
             search_json["beamwidth"] = 8;
+            search_json["search_cache_budget_gb"] = 0.01f;
             search_json["prefetch_batch_size"] = 16;
             search_json["enable_frequency_aware_cache"] = true;
 
@@ -213,6 +218,10 @@ TEST_CASE("PageANN vs DISKANN - Compatibility test", "[pageann][diskann]") {
         json["data_path"] = kRawDataPath;
         json["max_degree"] = 56;
         json["search_list_size"] = 128;
+        // DiskANN memory budget parameters
+        json["pq_code_budget_gb"] = 0.05f;
+        json["search_cache_budget_gb"] = 0.01f;
+        json["build_dram_budget_gb"] = 0.2f;
         return json;
     };
 
@@ -250,6 +259,7 @@ TEST_CASE("PageANN vs DISKANN - Compatibility test", "[pageann][diskann]") {
         search_json["index_prefix"] = kL2IndexPrefix;
         search_json["search_list_size"] = 64;
         search_json["beamwidth"] = 8;
+        search_json["search_cache_budget_gb"] = 0.01f;
 
         // PageANN should be able to load DISKANN-built index
         auto status = pageann.Deserialize(binset, search_json);
@@ -287,6 +297,10 @@ TEST_CASE("PageANN - Multi-metric support", "[pageann][metric]") {
         json["data_path"] = kRawDataPath;
         json["max_degree"] = 56;
         json["search_list_size"] = 128;
+        // DiskANN memory budget parameters
+        json["pq_code_budget_gb"] = 0.05f;
+        json["search_cache_budget_gb"] = 0.01f;
+        json["build_dram_budget_gb"] = 0.2f;
         return json;
     };
 
@@ -458,6 +472,10 @@ TEST_CASE("PageANN - GetVectorByIds test", "[pageann][getvector]") {
         json["data_path"] = kRawDataPath;
         json["max_degree"] = 56;
         json["search_list_size"] = 128;
+        // DiskANN memory budget parameters
+        json["pq_code_budget_gb"] = 0.05f;
+        json["search_cache_budget_gb"] = 0.01f;
+        json["build_dram_budget_gb"] = 0.2f;
         return json;
     };
 
