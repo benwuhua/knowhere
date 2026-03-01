@@ -36,6 +36,7 @@ class KnowhereConan(ConanFile):
         "with_faiss_tests": [True, False],
         "with_light": [True, False],
         "with_compile_prune": [True, False],
+        "with_pipnn": [True, False],
     }
     default_options = {
         "shared": True,
@@ -61,6 +62,7 @@ class KnowhereConan(ConanFile):
         "libcurl:with_ssl": False,
         "with_light": False,
         "with_compile_prune": False,
+        "with_pipnn": False,
         "folly:shared": True,
     }
 
@@ -117,6 +119,7 @@ class KnowhereConan(ConanFile):
         self.requires("libcurl/8.2.1")
         self.requires("simde/0.8.2")
         self.requires("xxhash/0.8.3")
+        self.requires("eigen/3.4.0")
         if self.settings.os == "Android":
             self.requires("openblas/0.3.27")
         if not self.options.with_light:
@@ -192,6 +195,7 @@ class KnowhereConan(ConanFile):
         tc.variables["WITH_FAISS_TESTS"] = self.options.with_faiss_tests
         tc.variables["WITH_LIGHT"] = self.options.with_light
         tc.variables["WITH_COMPILE_PRUNE"] = self.options.with_compile_prune
+        tc.variables["WITH_PIPNN"] = self.options.with_pipnn
 
         # Configure ccache
         tc.variables["CMAKE_CXX_COMPILER_LAUNCHER"] = "ccache"
