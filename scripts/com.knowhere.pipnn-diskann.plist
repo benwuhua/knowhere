@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <!-- PiPNN-DiskANN Daily Build and Test Job -->
+        <key>Label</key>
+        <string>com.knowhere.pipnn-diskann</string>
+
+        <key>ProgramArguments</key>
+        <array>
+            <dict>
+                <key>RunAtLoad</key>
+                <false/>
+            </dict>
+        </array>
+
+        <key>LowPriorityIO</key>
+        <integer>0</integer>
+
+        <key>Nice</key>
+        <integer>10</integer>
+
+        <key>ProcessType</key>
+        <string>Background</string>
+
+        <key>StartCalendarInterval</key>
+        <integer>86400</integer>
+        <!-- Run every 24 hours (86400 seconds) = daily at same time as first trigger -->
+
+        <key>StartCalendarIntervalUnit</key>
+        <string>Second</string>
+
+        <key>StartHour</key>
+        <integer>2</integer>
+        <!-- 2 AM UTC / 6 AM UTC - off-peak hours -->
+
+        <key>StartMinute</key>
+        <integer>0</integer>
+
+        <key>StandardOutPath</key>
+        <string>/tmp/pipnn-diskann-cron.out</string>
+
+        <key>StandardErrorPath</key>
+        <string>/tmp/pipnn-diskann-cron.err</string>
+
+        <key>WorkingDirectory</key>
+        <string>/Users/ryan/Code/knowhere</string>
+
+        <key>UserName</key>
+        <string>ryan</string>
+
+        <key>Program</key>
+        <string>/Users/ryan/Code/knowhere/scripts/pipnn-diskann-cron.sh</string>
+
+        <key>EnvironmentVariables</key>
+        <dict>
+            <key>PATH</key>
+            <string>/usr/local/bin:/usr/bin:/bin</string>
+        </dict>
+    </dict>
+</plist>
