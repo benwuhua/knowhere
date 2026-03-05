@@ -33,20 +33,21 @@ done
 
 ensure_local_command ssh
 load_remote_config
-require_remote_config REMOTE_HOST REMOTE_USER REMOTE_BUILD_DIR REMOTE_LOG_DIR
+require_remote_config REMOTE_HOST REMOTE_USER REMOTE_REPO_DIR REMOTE_BUILD_DIR REMOTE_LOG_DIR
 
 BUILD_TYPE="${BUILD_TYPE:-${DEFAULT_BUILD_TYPE}}"
 
-run_remote_script "${RUN_ALL}" "${FILTER}" "${BUILD_TYPE}" "${REMOTE_BUILD_DIR}" "${REMOTE_LOG_DIR}" <<'EOF'
+run_remote_script "${RUN_ALL}" "${FILTER}" "${BUILD_TYPE}" "${REMOTE_REPO_DIR}" "${REMOTE_BUILD_DIR}" "${REMOTE_LOG_DIR}" <<'EOF'
 set -euo pipefail
 
 run_all="$1"
 filter="$2"
 build_type="$3"
-build_dir="$4"
-log_dir="$5"
+repo_dir="$4"
+build_dir="$5"
+log_dir="$6"
 
-test_bin="${build_dir}/${build_type}/tests/ut/knowhere_tests"
+test_bin="${repo_dir}/build/${build_type}/tests/ut/knowhere_tests"
 if [[ ! -x "${test_bin}" ]]; then
     echo "missing test binary: ${test_bin}" >&2
     exit 1
@@ -66,6 +67,8 @@ log_file="${log_dir}/test_$(date -u +%Y%m%dT%H%M%SZ).log"
     fi
 } 2>&1 | tee "${log_file}"
 
-printf 'test=ok\n'
-printf 'log=%s\n' "${log_file}"
+printf 'test=ok
+'
+printf 'log=%s
+' "${log_file}"
 EOF
