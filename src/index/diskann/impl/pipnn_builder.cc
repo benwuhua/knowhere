@@ -94,13 +94,14 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
     }
 
     RBCPartitioner::Config rbc_config;
-    rbc_config.leaf_max_size =
+    const size_t default_leaf_max_size =
         std::max<size_t>(64, std::max<size_t>(config_.k_nn * 2, config_.max_degree * 2));
-    rbc_config.fanout_l1 = 8;
-    rbc_config.fanout_l2 = 4;
-    rbc_config.fanout_rest = 2;
-    rbc_config.overlap_k = 2;
-    rbc_config.base_seed = 42;
+    rbc_config.leaf_max_size = config_.leaf_max_size == 0 ? default_leaf_max_size : config_.leaf_max_size;
+    rbc_config.fanout_l1 = config_.fanout_l1;
+    rbc_config.fanout_l2 = config_.fanout_l2;
+    rbc_config.fanout_rest = config_.fanout_rest;
+    rbc_config.overlap_k = config_.overlap_k;
+    rbc_config.base_seed = config_.base_seed;
     RBCPartitioner partitioner(rbc_config);
 
     const auto leaves = partitioner.partition(data, n, dim);

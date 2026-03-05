@@ -28,6 +28,12 @@ class PiPNNBuilder {
         float alpha = 1.2f;
         bool final_prune = true;
         uint32_t num_threads = 0;
+        size_t leaf_max_size = 0;
+        uint32_t fanout_l1 = 8;
+        uint32_t fanout_l2 = 4;
+        uint32_t fanout_rest = 2;
+        uint32_t overlap_k = 2;
+        uint64_t base_seed = 42;
     };
 
     PiPNNBuilder();
