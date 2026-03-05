@@ -453,7 +453,7 @@ class PiPNNDiskANNIndexNode : public IndexNode {
         pipnn_diskann::PipnnConfig pipnn_cfg = build_conf;
         auto build_result = pipnn_diskann::BuildPipnnDiskANNGraph(data, n, d, graph_path, pipnn_cfg);
         if (!build_result.has_value()) {
-            LOG_KNOWHERE_ERROR_ << "PiPNN graph build failed: " << build_result.error();
+            LOG_KNOWHERE_ERROR_ << "PiPNN graph build failed: " << Status2String(build_result.error());
             return build_result.error();
         }
 
@@ -710,19 +710,14 @@ class PiPNNDiskANNIndexNode : public IndexNode {
         return Status::not_implemented;
     }
 
-    std::unique_ptr<BaseConfig>
-    CreateConfig() const override {
+    static std::unique_ptr<BaseConfig>
+    StaticCreateConfig() {
         return std::make_unique<pipnn_diskann::PipnnConfig>();
     }
 
-    int32_t
-    Type() const override {
-        return knowhere::IndexEnum::INDEX_DISKANN;
-    }
-
-    std::unique_ptr<IndexNode>
-    Clone(const BinarySet& binset) const override {
-        return nullptr;
+    std::unique_ptr<BaseConfig>
+    CreateConfig() const override {
+        return std::make_unique<pipnn_diskann::PipnnConfig>();
     }
 
     bool
@@ -838,7 +833,7 @@ class PiPNNDiskANNIndexNode : public IndexNode {
 
 // Registration
 KNOWHERE_SIMPLE_REGISTER_DENSE_FLOAT_ALL_GLOBAL(PIPNN_DISKANN, PiPNNDiskANNIndexNode,
-                                                 knowhere::feature::DISKANN)
+                                                 knowhere::feature::DISK)
 
 }  // namespace knowhere
 
