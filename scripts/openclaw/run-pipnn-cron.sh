@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+OPENCLAW_ENV_FILE="${OPENCLAW_ENV_FILE:-${HOME}/.config/knowhere-openclaw/openclaw-agent.env}"
+if [[ -f "${OPENCLAW_ENV_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${OPENCLAW_ENV_FILE}"
+fi
+
+required_vars=(
+    KNOWHERE_REPO_ROOT
+    OPENCLAW_WORKSPACE
+    OPENCLAW_MEMORY_DIR
+    TARGET_BRANCH
+    OPENCLAW_RUN_CMD
+)
+
+for var in "${required_vars[@]}"; do
+    if [[ -z "${!var:-}" ]]; then
+        echo "missing required config: ${var}" >&2
+        echo "set it in ${OPENCLAW_ENV_FILE}" >&2
+        exit 1
+    fi
+done
+
+for cmd in flock git /bin/zsh tee; do
+    if ! command -v "${cmd}" >/dev/null 2>&1; then
+        echo "missing required command: ${cmd}" >&2
+        exit 1
+    fi
+done
+
+OPENCLAW_LOG_DIR="${OPENCLAW_LOG_DIR:-${OPENCLAW_WORKSPACE}/logs}"
+CRON_LOCK_FILE="${CRON_LOCK_FILE:-/tmp/knowhere-pipnn-openclaw.lock}"
+TASK_QUEUE_TEMPLATE="${TASK_QUEUE_TEMPLATE:-${REPO_ROOT}/docs/openclaw/TASK_QUEUE.md}"
+RESULT_FILE="${OPENCLAW_MEMORY_DIR}/RESULT.md"
+
+mkdir -p "${OPENCLAW_LOG_DIR}" "${OPENCLAW_MEMORY_DIR}"
+exec 9>"${CRON_LOCK_FILE}"
+if ! flock -n 9; then
+    echo "another pipnn cron run is active, skip this trigger"
+    exit 0
+fi
+
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+log_file="${OPENCLAW_LOG_DIR}/cron_${ts}.log"
+
+if [[ ! -f "${OPENCLAW_MEMORY_DIR}/TASK_QUEUE.md" ]]; then
+    cp "${TASK_QUEUE_TEMPLATE}" "${OPENCLAW_MEMORY_DIR}/TASK_QUEUE.md"
+fi
+touch "${RESULT_FILE}"
+
+{
+    echo "[cron] start=${ts}"
+    echo "[cron] repo=${KNOWHERE_REPO_ROOT}"
+    echo "[cron] workspace=${OPENCLAW_WORKSPACE}"
+    echo "[cron] branch=${TARGET_BRANCH}"
+    echo "[cron] command=${OPENCLAW_RUN_CMD}"
+    echo "[cron] sync branch from origin"
+    git -C "${KNOWHERE_REPO_ROOT}" fetch origin "${TARGET_BRANCH}"
+    git -C "${KNOWHERE_REPO_ROOT}" checkout "${TARGET_BRANCH}"
+    git -C "${KNOWHERE_REPO_ROOT}" pull --rebase origin "${TARGET_BRANCH}"
+
+    echo "[cron] preflight: scripts/remote/check-env.sh"
+    cd "${KNOWHERE_REPO_ROOT}"
+    scripts/remote/check-env.sh
+
+    echo "[cron] execute openclaw run command"
+    /bin/zsh -lc "${OPENCLAW_RUN_CMD}"
+    run_status=0
+} > >(tee "${log_file}") 2>&1 || run_status=$?
+
+{
+    echo "[cron] fetch remote logs"
+    cd "${KNOWHERE_REPO_ROOT}"
+    scripts/remote/fetch-logs.sh || true
+} >>"${log_file}" 2>&1
+
+{
+    echo ""
+    echo "## OpenClaw Cron Report ${ts}"
+    echo "- Status: $([[ "${run_status:-0}" -eq 0 ]] && echo "PASS" || echo "FAIL(${run_status})")"
+    echo "- Branch: ${TARGET_BRANCH}"
+    echo "- Log: ${log_file}"
+    echo "- Queue: ${OPENCLAW_MEMORY_DIR}/TASK_QUEUE.md"
+} >>"${RESULT_FILE}"
+
+exit "${run_status:-0}"
