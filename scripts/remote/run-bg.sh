@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=scripts/remote/common.sh
+source "${SCRIPT_DIR}/common.sh"
+
+if [[ $# -lt 1 ]]; then
+    echo "usage: $0 <build|test> [options]" >&2
+    exit 1
+fi
+
+SUBCOMMAND="$1"
+shift
+
+BUILD_TYPE=""
+FILTER=""
+PREWARM_CMAKE="true"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --type)
+            BUILD_TYPE="$2"
+            shift 2
+            ;;
+        --filter)
+            FILTER="$2"
+            shift 2
+            ;;
+        --no-prewarm-cmake)
+            PREWARM_CMAKE="false"
+            shift
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+ensure_local_command ssh
+load_remote_config
+require_remote_config REMOTE_HOST REMOTE_USER REMOTE_REPO_DIR REMOTE_BUILD_DIR REMOTE_LOG_DIR REMOTE_CCACHE_DIR REMOTE_VENV_DIR
+
+BUILD_TYPE="${BUILD_TYPE:-${DEFAULT_BUILD_TYPE}}"
+
+case "${SUBCOMMAND}" in
+    build)
+        run_remote_script "${BUILD_TYPE}" "${WITH_UT}" "${WITH_DISKANN}" "${REMOTE_REPO_DIR}" "${REMOTE_BUILD_DIR}" "${REMOTE_LOG_DIR}" "${REMOTE_CCACHE_DIR}" "${REMOTE_VENV_DIR}" "${PREWARM_CMAKE}" <<'EOF'
+set -euo pipefail
+
+build_type="$1"
+with_ut="$2"
+with_diskann="$3"
+repo_dir="$4"
+build_dir="$5"
+log_dir="$6"
+ccache_dir="$7"
+venv_dir="$8"
+prewarm_cmake="$9"
+
+mkdir -p "${build_dir}" "${log_dir}" "${ccache_dir}"
+log_file="${log_dir}/build_bg_$(date -u +%Y%m%dT%H%M%SZ).log"
+cmd=$(cat <<CMD
+export PATH="${venv_dir}/bin:\$PATH"
+export CCACHE_DIR="${ccache_dir}"
+export CONAN_RETRY=1
+export CONAN_RETRY_WAIT=5
+clean_corrupted_conan_cache() {
+  rm -rf "\$HOME/.conan/data/cmake/3.30.5" 2>/dev/null || true
+  find "\$HOME/.conan/data/cmake/3.30.5" -type f -name '*.tgz' -delete 2>/dev/null || true
+  find "\$HOME/.conan/data/cmake/3.30.5" -type f -name 'metadata.json' -delete 2>/dev/null || true
+}
+prewarm_cmake_package() {
+  local attempt
+  for attempt in 1 2 3; do
+    echo "[build] prewarming cmake/3.30.5 attempt=\${attempt}"
+    clean_corrupted_conan_cache
+    if CONAN_RETRY=0 CONAN_RETRY_WAIT=0 conan download cmake/3.30.5@ -r conancenter; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+run_conan_install() {
+  local attempt
+  for attempt in 1 2; do
+    echo "[build] conan install attempt=\${attempt}"
+    clean_corrupted_conan_cache
+    if CONAN_RETRY=0 CONAN_RETRY_WAIT=0 conan install "${repo_dir}" --build=missing -o with_ut="${with_ut}" -o with_diskann="${with_diskann}" -s compiler.libcxx=libstdc++11 -s build_type="${build_type}"; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+cd "${build_dir}"
+echo "[build] commit=\$(git -C "${repo_dir}" rev-parse HEAD)"
+echo "[build] prewarm_cmake=${prewarm_cmake}"
+if [[ "${prewarm_cmake}" == "true" ]]; then
+  if ! prewarm_cmake_package; then
+    echo "[build] prewarm failed after retries"
+  fi
+fi
+run_conan_install
+conan build "${repo_dir}"
+CMD
+)
+nohup bash -lc "${cmd}" >"${log_file}" 2>&1 </dev/null &
+pid=$!
+printf 'task=build\n'
+printf 'pid=%s\n' "${pid}"
+printf 'log=%s\n' "${log_file}"
+EOF
+        ;;
+    test)
+        run_remote_script "${BUILD_TYPE}" "${FILTER}" "${REMOTE_BUILD_DIR}" "${REMOTE_LOG_DIR}" <<'EOF'
+set -euo pipefail
+
+build_type="$1"
+filter="$2"
+build_dir="$3"
+log_dir="$4"
+test_bin="${build_dir}/${build_type}/tests/ut/knowhere_tests"
+if [[ ! -x "${test_bin}" ]]; then
+    echo "missing test binary: ${test_bin}" >&2
+    exit 1
+fi
+mkdir -p "${log_dir}"
+log_file="${log_dir}/test_bg_$(date -u +%Y%m%dT%H%M%SZ).log"
+cmd=$(cat <<CMD
+cd "${build_dir}/${build_type}"
+"${test_bin}" "${filter:-[pipnn]}" -v
+CMD
+)
+nohup bash -lc "${cmd}" >"${log_file}" 2>&1 </dev/null &
+pid=$!
+printf 'task=test\n'
+printf 'pid=%s\n' "${pid}"
+printf 'log=%s\n' "${log_file}"
+EOF
+        ;;
+    *)
+        echo "unsupported subcommand: ${SUBCOMMAND}" >&2
+        exit 1
+        ;;
+esac
