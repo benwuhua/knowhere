@@ -27,7 +27,7 @@ for var in "${required_vars[@]}"; do
     fi
 done
 
-for cmd in flock git /bin/zsh tee; do
+for cmd in git /bin/zsh tee; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
         echo "missing required command: ${cmd}" >&2
         exit 1
@@ -40,10 +40,23 @@ TASK_QUEUE_TEMPLATE="${TASK_QUEUE_TEMPLATE:-${REPO_ROOT}/docs/openclaw/TASK_QUEU
 RESULT_FILE="${OPENCLAW_MEMORY_DIR}/RESULT.md"
 
 mkdir -p "${OPENCLAW_LOG_DIR}" "${OPENCLAW_MEMORY_DIR}"
-exec 9>"${CRON_LOCK_FILE}"
-if ! flock -n 9; then
-    echo "another pipnn cron run is active, skip this trigger"
-    exit 0
+LOCK_ACQUIRED="false"
+LOCK_DIR="${CRON_LOCK_FILE}.d"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"${CRON_LOCK_FILE}"
+    if ! flock -n 9; then
+        echo "another pipnn cron run is active, skip this trigger"
+        exit 0
+    fi
+    LOCK_ACQUIRED="true"
+else
+    if mkdir "${LOCK_DIR}" 2>/dev/null; then
+        LOCK_ACQUIRED="true"
+    else
+        echo "another pipnn cron run is active, skip this trigger"
+        exit 0
+    fi
+    trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true' EXIT
 fi
 
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
