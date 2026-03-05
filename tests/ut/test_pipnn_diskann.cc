@@ -11,19 +11,29 @@
 // under the License.
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "catch2/catch_approx.hpp"
 #include "catch2/catch_test_macros.hpp"
+#include "filemanager/FileManager.h"
+#include "filemanager/impl/LocalFileManager.h"
 #include "index/diskann/impl/hash_prune.h"
 #include "index/diskann/impl/pipnn_builder.h"
 #include "index/diskann/impl/pipnn_diskann_config.h"
 #include "index/diskann/impl/rbc_partition.h"
 #include "index/diskann/impl/vamana_serializer.h"
+#include "knowhere/comp/brute_force.h"
+#include "knowhere/index/index_factory.h"
+#include "knowhere/log.h"
+#include "knowhere/version.h"
+#include "utils.h"
 
 namespace {
 
@@ -36,6 +46,10 @@ namespace fs = std::filesystem;
 constexpr uint32_t kDim = 32;
 constexpr uint32_t kHashBits = 12;
 constexpr uint32_t kMaxDegree = 16;
+constexpr uint32_t kE2ENumRows = 10000;
+constexpr uint32_t kE2EDim = 128;
+constexpr uint32_t kE2ENumQueries = 100;
+constexpr uint32_t kE2EK = 10;
 
 std::vector<float>
 RandVec(uint32_t dim, std::mt19937& rng) {
@@ -55,6 +69,61 @@ L2Dist(const float* a, const float* b, uint32_t d) {
         sum += diff * diff;
     }
     return sum;
+}
+
+struct ScopedTempDir {
+    explicit ScopedTempDir(const std::string& prefix) {
+        const auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        dir = fs::temp_directory_path() / (prefix + "_" + std::to_string(now));
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        REQUIRE(fs::create_directories(dir));
+    }
+
+    ~ScopedTempDir() {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+
+    fs::path dir;
+};
+
+knowhere::Json
+MakeBaseJson(const uint32_t dim, const uint32_t k) {
+    knowhere::Json json;
+    json["dim"] = dim;
+    json["metric_type"] = knowhere::metric::L2;
+    json["k"] = k;
+    return json;
+}
+
+knowhere::Json
+MakeBuildJson(const std::string& index_prefix, const std::string& data_path, const uint32_t dim, const uint32_t rows) {
+    auto json = MakeBaseJson(dim, kE2EK);
+    json["index_prefix"] = index_prefix;
+    json["data_path"] = data_path;
+    json["max_degree"] = 32;
+    json["search_list_size"] = 100;
+    json["pq_code_budget_gb"] = sizeof(float) * dim * rows * 0.125 / (1024.0 * 1024.0 * 1024.0);
+    json["search_cache_budget_gb"] = sizeof(float) * dim * rows * 0.125 / (1024.0 * 1024.0 * 1024.0);
+    json["build_dram_budget_gb"] = 8.0;
+    return json;
+}
+
+knowhere::Json
+MakeDeserializeJson(const std::string& index_prefix, const uint32_t dim, const uint32_t rows) {
+    auto json = MakeBaseJson(dim, kE2EK);
+    json["index_prefix"] = index_prefix;
+    json["search_cache_budget_gb"] = sizeof(float) * dim * rows * 0.125 / (1024.0 * 1024.0 * 1024.0);
+    return json;
+}
+
+knowhere::Json
+MakeSearchJson(const uint32_t dim, const uint32_t k) {
+    auto json = MakeBaseJson(dim, k);
+    json["search_list_size"] = 64;
+    json["beamwidth"] = 8;
+    return json;
 }
 
 }  // namespace
@@ -435,3 +504,120 @@ TEST_CASE("VamanaSerializer: find_medoid", "[pipnn][serializer]") {
 
     REQUIRE(medoid_dist == Catch::Approx(best_dist).epsilon(0.01));
 }
+
+#ifdef KNOWHERE_WITH_PIPNN
+TEST_CASE("PiPNNDiskANNIndexNode build+search full pipeline", "[pipnn_diskann][e2e]") {
+    ScopedTempDir temp_dir("knowhere_pipnn_e2e");
+    const auto raw_path = (temp_dir.dir / "raw_data.bin").string();
+    const auto pipnn_index_prefix = (temp_dir.dir / "pipnn_index" / "pipnn").string();
+    REQUIRE(fs::create_directories(fs::path(pipnn_index_prefix).parent_path()));
+
+    auto base_ds = GenDataSet(kE2ENumRows, kE2EDim, 30);
+    auto query_ds = GenDataSet(kE2ENumQueries, kE2EDim, 42);
+    WriteRawDataToDisk<float>(raw_path, static_cast<const float*>(base_ds->GetTensor()), kE2ENumRows, kE2EDim);
+
+    auto version = GenTestVersionList();
+    std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+    auto diskann_index_pack = knowhere::Pack(file_manager);
+    auto create_res = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
+        knowhere::IndexEnum::INDEX_PIPNN_DISKANN, version, diskann_index_pack);
+    REQUIRE(create_res.has_value());
+    auto pipnn_index = create_res.value();
+
+    auto build_json = MakeBuildJson(pipnn_index_prefix, raw_path, kE2EDim, kE2ENumRows);
+    auto build_status = pipnn_index.Build(nullptr, build_json);
+    REQUIRE(build_status == knowhere::Status::success);
+
+    knowhere::BinarySet binset;
+    REQUIRE(pipnn_index.Serialize(binset) == knowhere::Status::success);
+
+    auto search_create_res = knowhere::IndexFactory::Instance().Create<knowhere::fp32>(
+        knowhere::IndexEnum::INDEX_PIPNN_DISKANN, version, diskann_index_pack);
+    REQUIRE(search_create_res.has_value());
+    auto pipnn_search_index = search_create_res.value();
+    auto deserialize_json = MakeDeserializeJson(pipnn_index_prefix, kE2EDim, kE2ENumRows);
+    REQUIRE(pipnn_search_index.Deserialize(binset, deserialize_json) == knowhere::Status::success);
+
+    auto search_json = MakeSearchJson(kE2EDim, kE2EK);
+    auto search_res = pipnn_search_index.Search(query_ds, search_json, nullptr);
+    REQUIRE(search_res.has_value());
+
+    auto result = search_res.value();
+    REQUIRE(result->GetRows() == kE2ENumQueries);
+    REQUIRE(result->GetDim() == kE2EK);
+
+    const auto* distances = result->GetDistance();
+    const auto* ids = result->GetIds();
+    for (int64_t i = 0; i < result->GetRows(); ++i) {
+        for (int64_t j = 0; j < result->GetDim(); ++j) {
+            const auto idx = i * result->GetDim() + j;
+            if (ids[idx] != -1) {
+                REQUIRE(distances[idx] >= 0.0f);
+            }
+        }
+    }
+}
+
+TEST_CASE("PiPNN vs DiskANN recall@10 comparison", "[pipnn_diskann][e2e][recall]") {
+    ScopedTempDir temp_dir("knowhere_pipnn_recall");
+    const auto raw_path = (temp_dir.dir / "raw_data.bin").string();
+    const auto pipnn_index_prefix = (temp_dir.dir / "pipnn_index" / "pipnn").string();
+    const auto diskann_index_prefix = (temp_dir.dir / "diskann_index" / "diskann").string();
+    REQUIRE(fs::create_directories(fs::path(pipnn_index_prefix).parent_path()));
+    REQUIRE(fs::create_directories(fs::path(diskann_index_prefix).parent_path()));
+
+    auto base_ds = GenDataSet(kE2ENumRows, kE2EDim, 30);
+    auto query_ds = GenDataSet(kE2ENumQueries, kE2EDim, 42);
+    WriteRawDataToDisk<float>(raw_path, static_cast<const float*>(base_ds->GetTensor()), kE2ENumRows, kE2EDim);
+
+    auto gt_json = MakeBaseJson(kE2EDim, kE2EK);
+    auto gt_res = knowhere::BruteForce::Search<knowhere::fp32>(base_ds, query_ds, gt_json, nullptr);
+    REQUIRE(gt_res.has_value());
+
+    auto version = GenTestVersionList();
+    std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+    auto diskann_index_pack = knowhere::Pack(file_manager);
+
+    auto build_and_search = [&](const std::string& index_type, const std::string& index_prefix) {
+        auto create_res =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(index_type, version, diskann_index_pack);
+        REQUIRE(create_res.has_value());
+        auto index = create_res.value();
+
+        auto build_json = MakeBuildJson(index_prefix, raw_path, kE2EDim, kE2ENumRows);
+        const auto start = std::chrono::steady_clock::now();
+        REQUIRE(index.Build(nullptr, build_json) == knowhere::Status::success);
+        const auto end = std::chrono::steady_clock::now();
+        const auto build_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+        knowhere::BinarySet binset;
+        REQUIRE(index.Serialize(binset) == knowhere::Status::success);
+
+        auto search_create_res =
+            knowhere::IndexFactory::Instance().Create<knowhere::fp32>(index_type, version, diskann_index_pack);
+        REQUIRE(search_create_res.has_value());
+        auto search_index = search_create_res.value();
+        auto deserialize_json = MakeDeserializeJson(index_prefix, kE2EDim, kE2ENumRows);
+        REQUIRE(search_index.Deserialize(binset, deserialize_json) == knowhere::Status::success);
+
+        auto search_json = MakeSearchJson(kE2EDim, kE2EK);
+        auto search_res = search_index.Search(query_ds, search_json, nullptr);
+        REQUIRE(search_res.has_value());
+        return std::make_pair(search_res.value(), build_ms);
+    };
+
+    const auto [pipnn_result, pipnn_build_ms] =
+        build_and_search(knowhere::IndexEnum::INDEX_PIPNN_DISKANN, pipnn_index_prefix);
+    const auto [diskann_result, diskann_build_ms] =
+        build_and_search(knowhere::IndexEnum::INDEX_DISKANN, diskann_index_prefix);
+
+    LOG_KNOWHERE_INFO_ << "PiPNN build time(ms): " << pipnn_build_ms;
+    LOG_KNOWHERE_INFO_ << "DiskANN build time(ms): " << diskann_build_ms;
+
+    const float pipnn_recall = GetKNNRecall(*gt_res.value(), *pipnn_result);
+    const float diskann_recall = GetKNNRecall(*gt_res.value(), *diskann_result);
+    LOG_KNOWHERE_INFO_ << "PiPNN recall@10: " << pipnn_recall << ", DiskANN recall@10: " << diskann_recall;
+
+    REQUIRE(pipnn_recall + 0.05f >= diskann_recall);
+}
+#endif
