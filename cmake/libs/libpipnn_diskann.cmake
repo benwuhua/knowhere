@@ -1,8 +1,13 @@
 # cmake/libs/libpipnn_diskann.cmake
 # PiPNN-DiskANN: requires DiskANN to be already included
-# Eigen is header-only, no link needed — just include dirs
+# Prefer imported target so include paths propagate reliably.
 
-find_package(Eigen3 REQUIRED)
-include_directories(${EIGEN3_INCLUDE_DIR})
+find_package(Eigen3 REQUIRED CONFIG)
 
-message(STATUS "PiPNN-DiskANN: Eigen3 found at ${EIGEN3_INCLUDE_DIR}")
+if(TARGET Eigen3::Eigen)
+  message(STATUS "PiPNN-DiskANN: using Eigen target Eigen3::Eigen")
+else()
+  # Fallback for non-standard Eigen package exports.
+  include_directories(${EIGEN3_INCLUDE_DIRS})
+  message(STATUS "PiPNN-DiskANN: Eigen3::Eigen target missing, fallback include dirs: ${EIGEN3_INCLUDE_DIRS}")
+endif()
