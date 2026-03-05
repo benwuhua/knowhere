@@ -11,6 +11,8 @@
 // under the License.
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -21,6 +23,7 @@
 #include "index/diskann/impl/pipnn_builder.h"
 #include "index/diskann/impl/pipnn_diskann_config.h"
 #include "index/diskann/impl/rbc_partition.h"
+#include "index/diskann/impl/vamana_serializer.h"
 
 namespace {
 
@@ -28,6 +31,7 @@ using knowhere::pipnn_diskann::HashPrune;
 using knowhere::pipnn_diskann::PiPNNBuilder;
 using knowhere::pipnn_diskann::PipnnConfig;
 using knowhere::pipnn_diskann::RBCPartitioner;
+namespace fs = std::filesystem;
 
 constexpr uint32_t kDim = 32;
 constexpr uint32_t kHashBits = 12;
@@ -350,4 +354,84 @@ TEST_CASE("PiPNNBuilder: graph connectivity", "[pipnn][builder]") {
 
     const size_t reached = std::accumulate(visited.begin(), visited.end(), size_t{0});
     REQUIRE(reached >= static_cast<size_t>(n * 8 / 10));
+}
+
+TEST_CASE("VamanaSerializer: round-trip read/write", "[pipnn][serializer]") {
+    constexpr uint32_t n = 100;
+
+    std::vector<std::vector<uint32_t>> graph(n);
+    std::mt19937 rng(42);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t n_nbrs = 5 + rng() % 5;
+        for (uint32_t j = 0; j < n_nbrs; ++j) {
+            const uint32_t nb = rng() % n;
+            if (nb != i) {
+                graph[i].push_back(nb);
+            }
+        }
+    }
+
+    const std::string path = (fs::temp_directory_path() / "test_vamana.index").string();
+
+    knowhere::pipnn_diskann::VamanaSerializer::write(graph, 42u, path);
+    REQUIRE(fs::exists(path));
+
+    std::ifstream f(path, std::ios::binary);
+    REQUIRE(f.is_open());
+
+    uint64_t index_size = 0;
+    uint32_t max_deg = 0;
+    uint32_t ep = 0;
+    uint64_t frozen = 0;
+
+    f.read(reinterpret_cast<char*>(&index_size), sizeof(index_size));
+    f.read(reinterpret_cast<char*>(&max_deg), sizeof(max_deg));
+    f.read(reinterpret_cast<char*>(&ep), sizeof(ep));
+    f.read(reinterpret_cast<char*>(&frozen), sizeof(frozen));
+
+    REQUIRE(ep == 42u);
+    REQUIRE(frozen == 0u);
+    REQUIRE(max_deg > 0);
+    REQUIRE(index_size > 24u);
+
+    fs::remove(path);
+}
+
+TEST_CASE("VamanaSerializer: find_medoid", "[pipnn][serializer]") {
+    constexpr uint32_t n = 50;
+    constexpr uint32_t dim = 8;
+
+    std::mt19937 rng(99);
+    std::vector<float> data(n * dim);
+    for (auto& x : data) {
+        x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    }
+
+    const uint32_t medoid = knowhere::pipnn_diskann::VamanaSerializer::find_medoid(data.data(), n, dim);
+    REQUIRE(medoid < n);
+
+    std::vector<float> centroid(dim, 0.0f);
+    for (uint32_t i = 0; i < n; ++i) {
+        for (uint32_t j = 0; j < dim; ++j) {
+            centroid[j] += data[i * dim + j] / static_cast<float>(n);
+        }
+    }
+
+    float medoid_dist = 0.0f;
+    float best_dist = 1e30f;
+    for (uint32_t i = 0; i < n; ++i) {
+        float dist = 0.0f;
+        for (uint32_t j = 0; j < dim; ++j) {
+            const float diff = data[i * dim + j] - centroid[j];
+            dist += diff * diff;
+        }
+        if (dist < best_dist) {
+            best_dist = dist;
+        }
+        if (i == medoid) {
+            medoid_dist = dist;
+        }
+    }
+
+    REQUIRE(medoid_dist == Catch::Approx(best_dist).epsilon(0.01));
 }
