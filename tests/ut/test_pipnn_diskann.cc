@@ -11,6 +11,7 @@
 // under the License.
 
 #include <algorithm>
+#include <numeric>
 #include <random>
 #include <vector>
 
@@ -18,11 +19,13 @@
 #include "catch2/catch_test_macros.hpp"
 #include "index/diskann/impl/hash_prune.h"
 #include "index/diskann/impl/pipnn_diskann_config.h"
+#include "index/diskann/impl/rbc_partition.h"
 
 namespace {
 
 using knowhere::pipnn_diskann::HashPrune;
 using knowhere::pipnn_diskann::PipnnConfig;
+using knowhere::pipnn_diskann::RBCPartitioner;
 
 constexpr uint32_t kDim = 32;
 constexpr uint32_t kHashBits = 12;
@@ -135,4 +138,102 @@ TEST_CASE("HashPrune insertion order robustness", "[pipnn][hash_prune]") {
         overlap += std::binary_search(backward.begin(), backward.end(), id) ? 1 : 0;
     }
     REQUIRE(overlap > 0);
+}
+
+TEST_CASE("RBC: every point appears in at least one leaf", "[pipnn][rbc]") {
+    constexpr uint32_t n = 256;
+    constexpr uint32_t dim = 16;
+
+    std::mt19937 rng(2024);
+    std::vector<float> data(n * dim);
+    for (auto& v : data) {
+        v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    }
+
+    RBCPartitioner::Config config;
+    config.leaf_max_size = 24;
+    config.fanout_l1 = 6;
+    config.fanout_l2 = 4;
+    config.fanout_rest = 2;
+    config.overlap_k = 2;
+    config.base_seed = 17;
+    RBCPartitioner partitioner(config);
+    const auto leaves = partitioner.partition(data.data(), n, dim);
+
+    REQUIRE_FALSE(leaves.empty());
+
+    std::vector<uint32_t> counts(n, 0);
+    for (const auto& leaf : leaves) {
+        for (auto id : leaf.point_ids) {
+            REQUIRE(id < n);
+            counts[id] += 1;
+        }
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        REQUIRE(counts[i] >= 1);
+    }
+}
+
+TEST_CASE("RBC: all leaf sizes <= leaf_max_size", "[pipnn][rbc]") {
+    constexpr uint32_t n = 640;
+    constexpr uint32_t dim = 24;
+
+    std::mt19937 rng(101);
+    std::vector<float> data(n * dim);
+    for (auto& v : data) {
+        v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    }
+
+    RBCPartitioner::Config config;
+    config.leaf_max_size = 32;
+    config.fanout_l1 = 8;
+    config.fanout_l2 = 4;
+    config.fanout_rest = 2;
+    config.overlap_k = 2;
+    config.base_seed = 29;
+    RBCPartitioner partitioner(config);
+    const auto leaves = partitioner.partition(data.data(), n, dim);
+
+    REQUIRE_FALSE(leaves.empty());
+    for (const auto& leaf : leaves) {
+        REQUIRE(leaf.point_ids.size() <= config.leaf_max_size);
+    }
+}
+
+TEST_CASE("RBC: overlap factor is reasonable", "[pipnn][rbc]") {
+    constexpr uint32_t n = 512;
+    constexpr uint32_t dim = 20;
+
+    std::mt19937 rng(99);
+    std::vector<float> data(n * dim);
+    for (auto& v : data) {
+        v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    }
+
+    RBCPartitioner::Config config;
+    config.leaf_max_size = 40;
+    config.fanout_l1 = 8;
+    config.fanout_l2 = 4;
+    config.fanout_rest = 2;
+    config.overlap_k = 2;
+    config.base_seed = 7;
+    RBCPartitioner partitioner(config);
+    const auto leaves = partitioner.partition(data.data(), n, dim);
+
+    REQUIRE_FALSE(leaves.empty());
+
+    std::vector<uint32_t> multiplicity(n, 0);
+    for (const auto& leaf : leaves) {
+        for (auto id : leaf.point_ids) {
+            multiplicity[id] += 1;
+        }
+    }
+
+    const uint64_t total_assignments = std::accumulate(multiplicity.begin(), multiplicity.end(), uint64_t{0});
+    const float overlap_factor = static_cast<float>(total_assignments) / static_cast<float>(n);
+
+    REQUIRE(overlap_factor >= 1.0f);
+    REQUIRE(overlap_factor <= 6.0f);
+    REQUIRE(overlap_factor > 1.1f);
 }
