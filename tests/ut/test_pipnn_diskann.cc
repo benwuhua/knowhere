@@ -18,12 +18,14 @@
 #include "catch2/catch_approx.hpp"
 #include "catch2/catch_test_macros.hpp"
 #include "index/diskann/impl/hash_prune.h"
+#include "index/diskann/impl/pipnn_builder.h"
 #include "index/diskann/impl/pipnn_diskann_config.h"
 #include "index/diskann/impl/rbc_partition.h"
 
 namespace {
 
 using knowhere::pipnn_diskann::HashPrune;
+using knowhere::pipnn_diskann::PiPNNBuilder;
 using knowhere::pipnn_diskann::PipnnConfig;
 using knowhere::pipnn_diskann::RBCPartitioner;
 
@@ -273,4 +275,79 @@ TEST_CASE("RBC: handles oversized num_leaders and still terminates", "[pipnn][rb
     for (uint32_t i = 0; i < n; ++i) {
         REQUIRE(counts[i] >= 1);
     }
+}
+
+TEST_CASE("PiPNNBuilder: basic graph construction", "[pipnn][builder]") {
+    constexpr uint32_t n = 320;
+    constexpr uint32_t dim = 16;
+
+    std::mt19937 rng(2025);
+    std::vector<float> data(n * dim);
+    for (auto& v : data) {
+        v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    }
+
+    PiPNNBuilder::Config config;
+    config.k_nn = 48;
+    config.hash_bits = 12;
+    config.max_degree = 24;
+    config.alpha = 1.2f;
+    config.final_prune = true;
+    config.num_threads = 2;
+
+    PiPNNBuilder builder(config);
+    const auto adjacency = builder.build(data.data(), n, dim);
+
+    REQUIRE(adjacency.size() == n);
+    for (uint32_t i = 0; i < n; ++i) {
+        REQUIRE(adjacency[i].size() >= 1);
+        REQUIRE(adjacency[i].size() <= config.max_degree);
+        for (auto nbr : adjacency[i]) {
+            REQUIRE(nbr < n);
+            REQUIRE(nbr != i);
+        }
+    }
+}
+
+TEST_CASE("PiPNNBuilder: graph connectivity", "[pipnn][builder]") {
+    constexpr uint32_t n = 400;
+    constexpr uint32_t dim = 24;
+
+    std::mt19937 rng(77);
+    std::vector<float> data(n * dim);
+    for (auto& v : data) {
+        v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    }
+
+    PiPNNBuilder::Config config;
+    config.k_nn = 56;
+    config.hash_bits = 12;
+    config.max_degree = 28;
+    config.alpha = 1.2f;
+    config.final_prune = true;
+    config.num_threads = 2;
+
+    PiPNNBuilder builder(config);
+    const auto adjacency = builder.build(data.data(), n, dim);
+
+    REQUIRE(adjacency.size() == n);
+
+    std::vector<uint8_t> visited(n, 0);
+    std::vector<uint32_t> q;
+    q.reserve(n);
+    q.push_back(0);
+    visited[0] = 1;
+
+    for (size_t head = 0; head < q.size(); ++head) {
+        const auto u = q[head];
+        for (auto v : adjacency[u]) {
+            if (!visited[v]) {
+                visited[v] = 1;
+                q.push_back(v);
+            }
+        }
+    }
+
+    const size_t reached = std::accumulate(visited.begin(), visited.end(), size_t{0});
+    REQUIRE(reached >= static_cast<size_t>(n * 8 / 10));
 }
