@@ -53,6 +53,13 @@ if [[ ! -x "${test_bin}" ]]; then
     exit 1
 fi
 
+# Extract RUNPATH from binary and set LD_LIBRARY_PATH
+# This is needed because some conan-built libraries lack RUNPATH
+runpath=$(readelf -d "${test_bin}" 2>/dev/null | sed -n 's/.*Library runpath: \[\(.*\)\]/\1/p' | head -1)
+if [[ -n "${runpath}" ]]; then
+    export LD_LIBRARY_PATH="${runpath}:${LD_LIBRARY_PATH:-}"
+fi
+
 mkdir -p "${log_dir}"
 log_file="${log_dir}/test_$(date -u +%Y%m%dT%H%M%SZ).log"
 
@@ -61,9 +68,9 @@ log_file="${log_dir}/test_$(date -u +%Y%m%dT%H%M%SZ).log"
     if [[ "${run_all}" == "true" ]]; then
         "${test_bin}"
     elif [[ -n "${filter}" ]]; then
-        "${test_bin}" "${filter}" -v
+        "${test_bin}" "${filter}"
     else
-        "${test_bin}" "[pipnn]" -v
+        "${test_bin}" "[pipnn]"
     fi
 } 2>&1 | tee "${log_file}"
 
