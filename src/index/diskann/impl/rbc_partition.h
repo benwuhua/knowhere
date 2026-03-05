@@ -41,7 +41,7 @@ public:
 
 private:
     void
-    recursive_partition(const float* data, uint32_t dim, const std::vector<uint32_t>& point_ids, size_t depth,
+    partition_recursive(const float* data, uint32_t dim, const std::vector<uint32_t>& point_ids, size_t depth,
                         std::vector<Leaf>& leaves) const;
 
     std::vector<uint32_t>

@@ -34,12 +34,12 @@ RBCPartitioner::partition(const float* data, uint32_t n, uint32_t dim) const {
 
     std::vector<uint32_t> point_ids(n);
     std::iota(point_ids.begin(), point_ids.end(), 0);
-    recursive_partition(data, dim, point_ids, 0, leaves);
+    partition_recursive(data, dim, point_ids, 0, leaves);
     return leaves;
 }
 
 void
-RBCPartitioner::recursive_partition(const float* data, uint32_t dim, const std::vector<uint32_t>& point_ids, size_t depth,
+RBCPartitioner::partition_recursive(const float* data, uint32_t dim, const std::vector<uint32_t>& point_ids, size_t depth,
                                     std::vector<Leaf>& leaves) const {
     if (point_ids.empty()) {
         return;
@@ -56,7 +56,11 @@ RBCPartitioner::recursive_partition(const float* data, uint32_t dim, const std::
         return;
     }
 
-    const uint32_t leaders_to_sample = std::max<uint32_t>(fanout, effective_num_leaders(point_ids.size()));
+    uint32_t leaders_to_sample = std::max<uint32_t>(fanout, effective_num_leaders(point_ids.size()));
+    if (point_ids.size() > 1) {
+        leaders_to_sample =
+            std::min<uint32_t>(leaders_to_sample, static_cast<uint32_t>(point_ids.size() - 1));
+    }
     auto leaders = sample_leaders(point_ids, leaders_to_sample, config_.base_seed + static_cast<uint32_t>(depth));
     if (leaders.size() > fanout) {
         leaders.resize(fanout);
@@ -82,7 +86,7 @@ RBCPartitioner::recursive_partition(const float* data, uint32_t dim, const std::
 
     for (const auto& bucket : buckets) {
         if (!bucket.empty()) {
-            recursive_partition(data, dim, bucket, depth + 1, leaves);
+            partition_recursive(data, dim, bucket, depth + 1, leaves);
         }
     }
 }
@@ -167,14 +171,17 @@ RBCPartitioner::effective_num_leaders(size_t subset_size) const {
     if (subset_size == 0) {
         return 0;
     }
+    if (subset_size == 1) {
+        return 1;
+    }
 
     if (config_.num_leaders > 0) {
-        return std::min<uint32_t>(config_.num_leaders, static_cast<uint32_t>(subset_size));
+        return std::min<uint32_t>(config_.num_leaders, static_cast<uint32_t>(subset_size - 1));
     }
 
     const auto by_sqrt = static_cast<uint32_t>(std::sqrt(static_cast<double>(subset_size)));
     const uint32_t default_leaders = std::max<uint32_t>(1, std::min<uint32_t>(by_sqrt, 1000));
-    return std::min<uint32_t>(default_leaders, static_cast<uint32_t>(subset_size));
+    return std::min<uint32_t>(default_leaders, static_cast<uint32_t>(subset_size - 1));
 }
 
 float

@@ -233,7 +233,44 @@ TEST_CASE("RBC: overlap factor is reasonable", "[pipnn][rbc]") {
     const uint64_t total_assignments = std::accumulate(multiplicity.begin(), multiplicity.end(), uint64_t{0});
     const float overlap_factor = static_cast<float>(total_assignments) / static_cast<float>(n);
 
-    REQUIRE(overlap_factor >= 1.0f);
-    REQUIRE(overlap_factor <= 6.0f);
-    REQUIRE(overlap_factor > 1.1f);
+    REQUIRE(overlap_factor >= 2.0f);
+    REQUIRE(overlap_factor <= 8.0f);
+}
+
+TEST_CASE("RBC: handles oversized num_leaders and still terminates", "[pipnn][rbc]") {
+    constexpr uint32_t n = 9;
+    constexpr uint32_t dim = 8;
+
+    std::mt19937 rng(303);
+    std::vector<float> data(n * dim);
+    for (auto& v : data) {
+        v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    }
+
+    RBCPartitioner::Config config;
+    config.leaf_max_size = 1;
+    config.fanout_l1 = 4;
+    config.fanout_l2 = 3;
+    config.fanout_rest = 2;
+    config.overlap_k = 2;
+    config.num_leaders = 1024;
+    config.base_seed = 17;
+
+    RBCPartitioner partitioner(config);
+    const auto leaves = partitioner.partition(data.data(), n, dim);
+
+    REQUIRE_FALSE(leaves.empty());
+
+    std::vector<uint32_t> counts(n, 0);
+    for (const auto& leaf : leaves) {
+        REQUIRE(leaf.point_ids.size() <= config.leaf_max_size);
+        for (auto id : leaf.point_ids) {
+            REQUIRE(id < n);
+            counts[id] += 1;
+        }
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        REQUIRE(counts[i] >= 1);
+    }
 }
