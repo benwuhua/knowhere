@@ -69,18 +69,6 @@ dedup_and_drop_self(uint32_t self_id, std::vector<uint32_t>& neighbors) {
 
 }  // namespace
 
-struct PiPNNBuilder::BuildContext {
-    explicit BuildContext(uint32_t n)
-        : adjacency(n), node_mutexes(n), leaf_total_ns(0), gemm_total_ns(0), hash_prune_total_ns(0) {
-    }
-
-    std::vector<std::vector<uint32_t>> adjacency;
-    std::vector<std::mutex> node_mutexes;
-    std::atomic<int64_t> leaf_total_ns;
-    std::atomic<int64_t> gemm_total_ns;
-    std::atomic<int64_t> hash_prune_total_ns;
-};
-
 PiPNNBuilder::PiPNNBuilder()
     : config_{} {
 }
@@ -167,7 +155,12 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
                 }
             }
 
+            const auto edge_insert_start = clock::now();
             insert_bidirectional_edge(i, best_j, context.adjacency, context.node_mutexes, config_.max_degree);
+            const auto edge_insert_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - edge_insert_start).count();
+            context.edge_insert_ns.fetch_add(edge_insert_ns, std::memory_order_relaxed);
+            context.edge_insert_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -179,6 +172,8 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
         LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(robust_prune_ns)
                            << " ms (Robust prune pass, num_points=" << n << ")";
     }
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(context.edge_insert_ns.load())
+                       << " ms (Edge insertion, count=" << context.edge_insert_count.load() << ")";
 
     return context.adjacency;
 }
@@ -260,7 +255,12 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
 
         const uint32_t global_i = leaf.point_ids[i];
         for (uint32_t neighbor : prune.neighbors()) {
+            const auto edge_insert_start = clock::now();
             insert_bidirectional_edge(global_i, neighbor, context.adjacency, context.node_mutexes, config_.max_degree);
+            const auto edge_insert_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - edge_insert_start).count();
+            context.edge_insert_ns.fetch_add(edge_insert_ns, std::memory_order_relaxed);
+            context.edge_insert_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
     const auto leaf_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - leaf_start).count();

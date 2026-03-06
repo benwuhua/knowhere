@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "index/diskann/impl/hash_prune.h"
@@ -43,7 +45,25 @@ class PiPNNBuilder {
     build(const float* data, uint32_t n, uint32_t dim) const;
 
  private:
-    struct BuildContext;
+    struct BuildContext {
+        explicit BuildContext(uint32_t n)
+            : adjacency(n),
+              node_mutexes(n),
+              leaf_total_ns(0),
+              gemm_total_ns(0),
+              hash_prune_total_ns(0),
+              edge_insert_ns(0),
+              edge_insert_count(0) {
+        }
+
+        std::vector<std::vector<uint32_t>> adjacency;
+        std::vector<std::mutex> node_mutexes;
+        std::atomic<int64_t> leaf_total_ns;
+        std::atomic<int64_t> gemm_total_ns;
+        std::atomic<int64_t> hash_prune_total_ns;
+        std::atomic<int64_t> edge_insert_ns;
+        std::atomic<int64_t> edge_insert_count;
+    };
 
     void
     process_leaf(const float* data, uint32_t dim, const Leaf& leaf, BuildContext& context) const;
