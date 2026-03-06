@@ -13,6 +13,7 @@
 
 #include "knowhere/feder/DiskANN.h"
 
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -22,6 +23,7 @@
 #include "diskann/pq_flash_index.h"
 #include "filemanager/FileManager.h"
 #include "fmt/core.h"
+#include "index/diskann/impl/pipnn_build_profile.h"
 #include "index/diskann/impl/pipnn_builder.h"
 #include "index/diskann/impl/vamana_serializer.h"
 #include "index/diskann/pipnn_diskann_config.h"
@@ -286,6 +288,7 @@ PiPNNDiskANNIndexNode<DataType>::Build(const DataSetPtr dataset, std::shared_ptr
                                        bool use_knowhere_build_pool) {
     (void)dataset;
     (void)use_knowhere_build_pool;
+    using clock = std::chrono::steady_clock;
 
     assert(file_manager_ != nullptr);
     auto build_conf = static_cast<const PiPNNDiskANNConfig&>(*cfg);
@@ -341,6 +344,8 @@ PiPNNDiskANNIndexNode<DataType>::Build(const DataSetPtr dataset, std::shared_ptr
     pipnn_cfg.fanout_l1 = static_cast<uint32_t>(build_conf.pipnn_fanout_l1.value());
     pipnn_cfg.fanout_l2 = static_cast<uint32_t>(build_conf.pipnn_fanout_l2.value());
 
+    pipnn_diskann::BuildProfile build_profile;
+    const auto graph_stage_start = clock::now();
     pipnn_diskann::PiPNNBuilder builder(pipnn_cfg);
     auto graph = builder.build(float_data.get(), static_cast<uint32_t>(count), static_cast<uint32_t>(dim));
     if (graph.size() != count) {
@@ -358,6 +363,12 @@ PiPNNDiskANNIndexNode<DataType>::Build(const DataSetPtr dataset, std::shared_ptr
         LOG_KNOWHERE_ERROR_ << "Failed to write PiPNN mem index: " << e.what();
         return Status::disk_file_error;
     }
+    build_profile.graph_construction_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - graph_stage_start).count();
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Build stage: "
+                       << build_profile.stage_ms(pipnn_diskann::BuildStage::kGraphConstruction) << " ms ("
+                       << pipnn_diskann::BuildStageName(pipnn_diskann::BuildStage::kGraphConstruction)
+                       << ", num_points=" << count << ", dim=" << dim << ")";
 
     const bool need_norm = IsMetricType(build_conf.metric_type.value(), knowhere::metric::IP) ||
                            IsMetricType(build_conf.metric_type.value(), knowhere::metric::COSINE);
@@ -384,6 +395,7 @@ PiPNNDiskANNIndexNode<DataType>::Build(const DataSetPtr dataset, std::shared_ptr
                                                        build_conf.accelerate_build.value(),
                                                        static_cast<uint32_t>(num_nodes_to_cache),
                                                        build_conf.shuffle_build.value()};
+    const auto pq_stage_start = clock::now();
     RETURN_IF_ERROR(TryDiskANNCall([&]() {
         int res = diskann::build_disk_index<DataType>(diskann_internal_build_config);
         if (res != 0) {
@@ -391,6 +403,24 @@ PiPNNDiskANNIndexNode<DataType>::Build(const DataSetPtr dataset, std::shared_ptr
                                         -1);
         }
     }));
+    build_profile.pq_and_disk_layout_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - pq_stage_start).count();
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Build stage: "
+                       << build_profile.stage_ms(pipnn_diskann::BuildStage::kPQAndDiskLayout) << " ms ("
+                       << pipnn_diskann::BuildStageName(pipnn_diskann::BuildStage::kPQAndDiskLayout)
+                       << ", num_points=" << count << ", dim=" << dim << ")";
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Build stage: "
+                       << build_profile.stage_ms(pipnn_diskann::BuildStage::kTotal) << " ms ("
+                       << pipnn_diskann::BuildStageName(pipnn_diskann::BuildStage::kTotal)
+                       << ", graph_pct=" << (build_profile.total_ns() == 0
+                                                 ? 0.0
+                                                 : 100.0 * static_cast<double>(build_profile.graph_construction_ns) /
+                                                       static_cast<double>(build_profile.total_ns()))
+                       << ", pq_disk_pct=" << (build_profile.total_ns() == 0
+                                                   ? 0.0
+                                                   : 100.0 * static_cast<double>(build_profile.pq_and_disk_layout_ns) /
+                                                         static_cast<double>(build_profile.total_ns()))
+                       << ")";
 
     for (auto& filename : GetNecessaryFilenames(index_prefix_, need_norm, true, true)) {
         if (!AddFile(filename)) {

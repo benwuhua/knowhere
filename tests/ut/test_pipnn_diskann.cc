@@ -24,6 +24,7 @@
 #include "catch2/catch_test_macros.hpp"
 #include "filemanager/FileManager.h"
 #include "filemanager/impl/LocalFileManager.h"
+#include "index/diskann/impl/pipnn_build_profile.h"
 #include "index/diskann/impl/hash_prune.h"
 #include "index/diskann/impl/pipnn_builder.h"
 #include "index/diskann/impl/pipnn_diskann_config.h"
@@ -38,6 +39,10 @@
 namespace {
 
 using knowhere::pipnn_diskann::HashPrune;
+using knowhere::pipnn_diskann::BuildProfile;
+using knowhere::pipnn_diskann::BuildStage;
+using knowhere::pipnn_diskann::BuildStageName;
+using knowhere::pipnn_diskann::NsToMs;
 using knowhere::pipnn_diskann::PiPNNBuilder;
 using knowhere::pipnn_diskann::PipnnConfig;
 using knowhere::pipnn_diskann::RBCPartitioner;
@@ -143,6 +148,21 @@ TEST_CASE("PipnnConfig ToString", "[pipnn_diskann]") {
     REQUIRE(s.find("partitions=32") != std::string::npos);
     REQUIRE(s.find("overlap=0.500000") != std::string::npos);
     REQUIRE(s.find("max_degree=32") != std::string::npos);
+}
+
+TEST_CASE("PiPNN build profile separates graph and PQ stages", "[pipnn][profile]") {
+    BuildProfile profile;
+    profile.graph_construction_ns = 125000000;
+    profile.pq_and_disk_layout_ns = 875000000;
+
+    REQUIRE(BuildStageName(BuildStage::kGraphConstruction) == "PiPNN graph construction");
+    REQUIRE(BuildStageName(BuildStage::kPQAndDiskLayout) == "DiskANN PQ/disk layout");
+    REQUIRE(BuildStageName(BuildStage::kTotal) == "PiPNN-DiskANN total build");
+    REQUIRE(profile.total_ns() == 1000000000);
+    REQUIRE(profile.stage_ms(BuildStage::kGraphConstruction) == Catch::Approx(125.0));
+    REQUIRE(profile.stage_ms(BuildStage::kPQAndDiskLayout) == Catch::Approx(875.0));
+    REQUIRE(profile.stage_ms(BuildStage::kTotal) == Catch::Approx(1000.0));
+    REQUIRE(NsToMs(500000) == Catch::Approx(0.5));
 }
 
 TEST_CASE("HashPrune enforces max_degree", "[pipnn][hash_prune]") {
