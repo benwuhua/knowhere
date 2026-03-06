@@ -611,6 +611,9 @@ TEST_CASE("PiPNN vs DiskANN recall@10 comparison", "[pipnn_diskann][e2e][recall]
     const auto [diskann_result, diskann_build_ms] =
         build_and_search(knowhere::IndexEnum::INDEX_DISKANN, diskann_index_prefix);
 
+    LOG_KNOWHERE_INFO_
+        << "[PiPNN Profiling] Stage: " << pipnn_build_ms
+        << " ms (PiPNN total build in recall test; stage breakdown is logged by PiPNNBuilder::build)";
     LOG_KNOWHERE_INFO_ << "PiPNN build time(ms): " << pipnn_build_ms;
     LOG_KNOWHERE_INFO_ << "DiskANN build time(ms): " << diskann_build_ms;
 

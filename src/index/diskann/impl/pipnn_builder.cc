@@ -12,12 +12,16 @@
 #include "index/diskann/impl/pipnn_builder.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <mutex>
 #include <numeric>
 #include <vector>
 
 #include <Eigen/Dense>
+
+#include "knowhere/log.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -67,11 +71,14 @@ dedup_and_drop_self(uint32_t self_id, std::vector<uint32_t>& neighbors) {
 
 struct PiPNNBuilder::BuildContext {
     explicit BuildContext(uint32_t n)
-        : adjacency(n), node_mutexes(n) {
+        : adjacency(n), node_mutexes(n), leaf_total_ns(0), gemm_total_ns(0), hash_prune_total_ns(0) {
     }
 
     std::vector<std::vector<uint32_t>> adjacency;
     std::vector<std::mutex> node_mutexes;
+    std::atomic<int64_t> leaf_total_ns;
+    std::atomic<int64_t> gemm_total_ns;
+    std::atomic<int64_t> hash_prune_total_ns;
 };
 
 PiPNNBuilder::PiPNNBuilder()
@@ -87,6 +94,9 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
     if (data == nullptr || n == 0 || dim == 0) {
         return {};
     }
+
+    using clock = std::chrono::steady_clock;
+    const auto ns_to_ms = [](int64_t ns) { return static_cast<double>(ns) / 1e6; };
 
     BuildContext context(n);
     for (auto& neighbors : context.adjacency) {
@@ -104,8 +114,13 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
     rbc_config.base_seed = config_.base_seed;
     RBCPartitioner partitioner(rbc_config);
 
+    const auto rbc_start = clock::now();
     const auto leaves = partitioner.partition(data, n, dim);
+    const auto rbc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - rbc_start).count();
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(rbc_ns)
+                       << " ms (RBC partition, leaves=" << leaves.size() << ", num_points=" << n << ")";
 
+    const auto leaf_process_start = clock::now();
 #ifdef _OPENMP
     const int num_threads =
         config_.num_threads == 0 ? omp_get_max_threads() : static_cast<int>(config_.num_threads);
@@ -118,6 +133,18 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
         process_leaf(data, dim, leaf, context);
     }
 #endif
+    const auto leaf_process_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - leaf_process_start).count();
+    const double leaf_avg_ms =
+        leaves.empty() ? 0.0 : ns_to_ms(leaf_process_ns) / static_cast<double>(leaves.size());
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(leaf_process_ns)
+                       << " ms (Parallel leaf processing, avg_per_leaf_ms=" << leaf_avg_ms
+                       << ", leaves=" << leaves.size()
+                       << ", accumulated_leaf_cpu_ms=" << ns_to_ms(context.leaf_total_ns.load()) << ")";
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(context.gemm_total_ns.load())
+                       << " ms (GEMM distance matrix computation, leaves=" << leaves.size() << ")";
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(context.hash_prune_total_ns.load())
+                       << " ms (HashPrune insertion, leaves=" << leaves.size() << ")";
 
     if (n > 1) {
         for (uint32_t i = 0; i < n; ++i) {
@@ -145,7 +172,12 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
     }
 
     if (config_.final_prune) {
+        const auto robust_prune_start = clock::now();
         robust_prune_pass(data, n, dim, context.adjacency);
+        const auto robust_prune_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - robust_prune_start).count();
+        LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(robust_prune_ns)
+                           << " ms (Robust prune pass, num_points=" << n << ")";
     }
 
     return context.adjacency;
@@ -157,6 +189,8 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
         return;
     }
 
+    using clock = std::chrono::steady_clock;
+    const auto leaf_start = clock::now();
     const uint32_t leaf_size = static_cast<uint32_t>(leaf.point_ids.size());
     RowMajorMatrixXf x(leaf_size, dim);
     for (uint32_t local_id = 0; local_id < leaf_size; ++local_id) {
@@ -167,6 +201,7 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
         }
     }
 
+    const auto gemm_start = clock::now();
     Eigen::VectorXf norms = x.rowwise().squaredNorm();
     Eigen::MatrixXf d_mat = -2.0f * x * x.transpose();
     d_mat.colwise() += norms;
@@ -174,6 +209,8 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
     for (uint32_t i = 0; i < leaf_size; ++i) {
         d_mat(i, i) = std::numeric_limits<float>::max();
     }
+    const auto gemm_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - gemm_start).count();
+    context.gemm_total_ns.fetch_add(gemm_ns, std::memory_order_relaxed);
 
     HashPrune sketcher(dim, config_.hash_bits, config_.max_degree);
     std::vector<std::vector<float>> sketches(leaf_size, std::vector<float>(config_.hash_bits));
@@ -210,18 +247,24 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
         });
 
         HashPrune prune(dim, config_.hash_bits, config_.max_degree);
+        const auto hash_prune_insert_start = clock::now();
         for (const auto& candidate : candidates) {
             const uint32_t local_j = candidate.second;
             const uint32_t global_j = leaf.point_ids[local_j];
             const float dist = std::max(0.0f, candidate.first);
             prune.insert(global_j, sketches[i].data(), sketches[local_j].data(), dist);
         }
+        const auto hash_prune_insert_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - hash_prune_insert_start).count();
+        context.hash_prune_total_ns.fetch_add(hash_prune_insert_ns, std::memory_order_relaxed);
 
         const uint32_t global_i = leaf.point_ids[i];
         for (uint32_t neighbor : prune.neighbors()) {
             insert_bidirectional_edge(global_i, neighbor, context.adjacency, context.node_mutexes, config_.max_degree);
         }
     }
+    const auto leaf_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - leaf_start).count();
+    context.leaf_total_ns.fetch_add(leaf_ns, std::memory_order_relaxed);
 }
 
 void
