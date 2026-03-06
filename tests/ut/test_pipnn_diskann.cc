@@ -425,6 +425,48 @@ TEST_CASE("PiPNNBuilder: graph connectivity", "[pipnn][builder]") {
     REQUIRE(reached >= static_cast<size_t>(n * 8 / 10));
 }
 
+TEST_CASE("PiPNNBuilder: concurrent edge insertion preserves symmetric unique adjacency", "[pipnn][builder]") {
+    constexpr uint32_t n = 256;
+    constexpr uint32_t dim = 20;
+
+    std::mt19937 rng(1234);
+    std::vector<float> data(n * dim);
+    for (auto& v : data) {
+        v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    }
+
+    PiPNNBuilder::Config config;
+    config.k_nn = 64;
+    config.hash_bits = 12;
+    config.max_degree = 32;
+    config.final_prune = false;
+    config.num_threads = 4;
+    config.leaf_max_size = 24;
+    config.fanout_l1 = 8;
+    config.fanout_l2 = 4;
+    config.fanout_rest = 2;
+    config.overlap_k = 3;
+
+    PiPNNBuilder builder(config);
+    const auto adjacency = builder.build(data.data(), n, dim);
+
+    REQUIRE(adjacency.size() == n);
+    for (uint32_t u = 0; u < n; ++u) {
+        const auto& neighbors = adjacency[u];
+        REQUIRE(neighbors.size() >= 1);
+        REQUIRE(neighbors.size() <= config.max_degree);
+
+        std::vector<uint32_t> sorted_neighbors = neighbors;
+        std::sort(sorted_neighbors.begin(), sorted_neighbors.end());
+        REQUIRE(std::adjacent_find(sorted_neighbors.begin(), sorted_neighbors.end()) == sorted_neighbors.end());
+
+        for (uint32_t v : neighbors) {
+            REQUIRE(v < n);
+            REQUIRE(v != u);
+        }
+    }
+}
+
 TEST_CASE("VamanaSerializer: round-trip read/write", "[pipnn][serializer]") {
     constexpr uint32_t n = 100;
 

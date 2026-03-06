@@ -15,7 +15,6 @@
 #include <atomic>
 #include <chrono>
 #include <limits>
-#include <mutex>
 #include <numeric>
 #include <vector>
 
@@ -32,6 +31,53 @@ namespace {
 
 using RowMajorMatrixXf = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
+struct EdgeLockStats {
+    int64_t wait_ns = 0;
+    bool contended = false;
+};
+
+class NodeLockGuard {
+ public:
+    NodeLockGuard(SpinMutex& first, SpinMutex* second, EdgeLockStats& stats)
+        : first_(&first),
+          second_(second) {
+        using clock = std::chrono::steady_clock;
+        const auto lock_start = clock::now();
+        bool contended = false;
+
+        if (!first_->try_lock()) {
+            contended = true;
+            first_->lock();
+        }
+        if (second_ != nullptr && second_ != first_) {
+            if (!second_->try_lock()) {
+                contended = true;
+                second_->lock();
+            }
+        }
+
+        if (contended) {
+            stats.contended = true;
+            stats.wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - lock_start).count();
+        }
+    }
+
+    ~NodeLockGuard() {
+        if (second_ != nullptr && second_ != first_) {
+            second_->unlock();
+        }
+        first_->unlock();
+    }
+
+    NodeLockGuard(const NodeLockGuard&) = delete;
+    NodeLockGuard&
+    operator=(const NodeLockGuard&) = delete;
+
+ private:
+    SpinMutex* first_;
+    SpinMutex* second_;
+};
+
 void
 insert_neighbor(std::vector<uint32_t>& neighbors, uint32_t dst, uint32_t max_degree) {
     if (std::find(neighbors.begin(), neighbors.end(), dst) != neighbors.end()) {
@@ -44,20 +90,19 @@ insert_neighbor(std::vector<uint32_t>& neighbors, uint32_t dst, uint32_t max_deg
 
 void
 insert_bidirectional_edge(uint32_t u, uint32_t v, std::vector<std::vector<uint32_t>>& adjacency,
-                          std::vector<std::mutex>& node_mutexes, uint32_t max_degree) {
+                          SpinMutex* node_locks, uint32_t max_degree,
+                          EdgeLockStats* lock_stats = nullptr) {
     if (u == v) {
         return;
     }
 
-    if (u < v) {
-        std::scoped_lock guard(node_mutexes[u], node_mutexes[v]);
-        insert_neighbor(adjacency[u], v, max_degree);
-        insert_neighbor(adjacency[v], u, max_degree);
-    } else {
-        std::scoped_lock guard(node_mutexes[v], node_mutexes[u]);
-        insert_neighbor(adjacency[u], v, max_degree);
-        insert_neighbor(adjacency[v], u, max_degree);
-    }
+    EdgeLockStats local_stats;
+    EdgeLockStats& stats = lock_stats == nullptr ? local_stats : *lock_stats;
+    const uint32_t first_id = std::min(u, v);
+    const uint32_t second_id = std::max(u, v);
+    NodeLockGuard guard(node_locks[first_id], &node_locks[second_id], stats);
+    insert_neighbor(adjacency[u], v, max_degree);
+    insert_neighbor(adjacency[v], u, max_degree);
 }
 
 void
@@ -156,11 +201,17 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
             }
 
             const auto edge_insert_start = clock::now();
-            insert_bidirectional_edge(i, best_j, context.adjacency, context.node_mutexes, config_.max_degree);
+            EdgeLockStats lock_stats;
+            insert_bidirectional_edge(
+                i, best_j, context.adjacency, context.node_locks.get(), config_.max_degree, &lock_stats);
             const auto edge_insert_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - edge_insert_start).count();
             context.edge_insert_ns.fetch_add(edge_insert_ns, std::memory_order_relaxed);
             context.edge_insert_count.fetch_add(1, std::memory_order_relaxed);
+            context.edge_lock_wait_ns.fetch_add(lock_stats.wait_ns, std::memory_order_relaxed);
+            if (lock_stats.contended) {
+                context.edge_lock_contention_count.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -174,6 +225,10 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
     }
     LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(context.edge_insert_ns.load())
                        << " ms (Edge insertion, count=" << context.edge_insert_count.load() << ")";
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(context.edge_lock_wait_ns.load())
+                       << " ms (Edge lock wait, lock_impl=spinlock, contended_inserts="
+                       << context.edge_lock_contention_count.load() << ", lock_bytes="
+                       << (static_cast<uint64_t>(sizeof(SpinMutex)) * n) << ")";
 
     return context.adjacency;
 }
@@ -256,11 +311,21 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
         const uint32_t global_i = leaf.point_ids[i];
         for (uint32_t neighbor : prune.neighbors()) {
             const auto edge_insert_start = clock::now();
-            insert_bidirectional_edge(global_i, neighbor, context.adjacency, context.node_mutexes, config_.max_degree);
+            EdgeLockStats lock_stats;
+            insert_bidirectional_edge(global_i,
+                                      neighbor,
+                                      context.adjacency,
+                                      context.node_locks.get(),
+                                      config_.max_degree,
+                                      &lock_stats);
             const auto edge_insert_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - edge_insert_start).count();
             context.edge_insert_ns.fetch_add(edge_insert_ns, std::memory_order_relaxed);
             context.edge_insert_count.fetch_add(1, std::memory_order_relaxed);
+            context.edge_lock_wait_ns.fetch_add(lock_stats.wait_ns, std::memory_order_relaxed);
+            if (lock_stats.contended) {
+                context.edge_lock_contention_count.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     const auto leaf_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - leaf_start).count();

@@ -13,13 +13,43 @@
 
 #include <atomic>
 #include <cstdint>
-#include <mutex>
+#include <memory>
+#include <thread>
 #include <vector>
 
 #include "index/diskann/impl/hash_prune.h"
 #include "index/diskann/impl/rbc_partition.h"
 
 namespace knowhere::pipnn_diskann {
+
+class SpinMutex {
+ public:
+    SpinMutex() noexcept = default;
+
+    SpinMutex(const SpinMutex&) = delete;
+    SpinMutex&
+    operator=(const SpinMutex&) = delete;
+
+    bool
+    try_lock() noexcept {
+        return !flag_.test_and_set(std::memory_order_acquire);
+    }
+
+    void
+    lock() noexcept {
+        while (flag_.test_and_set(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+
+    void
+    unlock() noexcept {
+        flag_.clear(std::memory_order_release);
+    }
+
+ private:
+    std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+};
 
 class PiPNNBuilder {
  public:
@@ -48,21 +78,25 @@ class PiPNNBuilder {
     struct BuildContext {
         explicit BuildContext(uint32_t n)
             : adjacency(n),
-              node_mutexes(n),
+              node_locks(std::make_unique<SpinMutex[]>(n)),
               leaf_total_ns(0),
               gemm_total_ns(0),
               hash_prune_total_ns(0),
               edge_insert_ns(0),
-              edge_insert_count(0) {
+              edge_insert_count(0),
+              edge_lock_wait_ns(0),
+              edge_lock_contention_count(0) {
         }
 
         std::vector<std::vector<uint32_t>> adjacency;
-        std::vector<std::mutex> node_mutexes;
+        std::unique_ptr<SpinMutex[]> node_locks;
         std::atomic<int64_t> leaf_total_ns;
         std::atomic<int64_t> gemm_total_ns;
         std::atomic<int64_t> hash_prune_total_ns;
         std::atomic<int64_t> edge_insert_ns;
         std::atomic<int64_t> edge_insert_count;
+        std::atomic<int64_t> edge_lock_wait_ns;
+        std::atomic<int64_t> edge_lock_contention_count;
     };
 
     void
