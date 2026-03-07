@@ -17,6 +17,24 @@ shift
 BUILD_TYPE=""
 FILTER=""
 PREWARM_CMAKE="true"
+LABEL=""
+ENV_VARS=()
+
+sanitize_label() {
+    local raw="${1:-}"
+    if [[ -z "${raw}" ]]; then
+        return 0
+    fi
+    printf '%s' "${raw}" | tr -cs 'A-Za-z0-9._-' '_'
+}
+
+validate_env_assignment() {
+    local assignment="${1:-}"
+    if [[ ! "${assignment}" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]]; then
+        echo "invalid --env assignment: ${assignment}" >&2
+        exit 1
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -26,6 +44,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --filter)
             FILTER="$2"
+            shift 2
+            ;;
+        --label)
+            LABEL="$(sanitize_label "$2")"
+            shift 2
+            ;;
+        --env)
+            validate_env_assignment "$2"
+            ENV_VARS+=("$2")
             shift 2
             ;;
         --no-prewarm-cmake)
@@ -116,23 +143,42 @@ printf 'log=%s\n' "${log_file}"
 EOF
         ;;
     test)
-        run_remote_script "${BUILD_TYPE}" "${FILTER}" "${REMOTE_BUILD_DIR}" "${REMOTE_LOG_DIR}" <<'EOF'
+        run_remote_script "${BUILD_TYPE}" "${FILTER}" "${LABEL}" "${REMOTE_REPO_DIR}" "${REMOTE_LOG_DIR}" "${#ENV_VARS[@]}" "${ENV_VARS[@]}" <<'EOF'
 set -euo pipefail
 
 build_type="$1"
 filter="$2"
-build_dir="$3"
-log_dir="$4"
-test_bin="${build_dir}/${build_type}/tests/ut/knowhere_tests"
+label="$3"
+repo_dir="$4"
+log_dir="$5"
+env_count="$6"
+shift 6
+
+for ((i = 0; i < env_count; ++i)); do
+    export "$1"
+    shift
+done
+
+test_bin="${repo_dir}/build/${build_type}/tests/ut/knowhere_tests"
 if [[ ! -x "${test_bin}" ]]; then
     echo "missing test binary: ${test_bin}" >&2
     exit 1
 fi
+
+runpath=$(readelf -d "${test_bin}" 2>/dev/null | sed -n 's/.*Library runpath: \[\(.*\)\]/\1/p' | head -1)
+if [[ -n "${runpath}" ]]; then
+    export LD_LIBRARY_PATH="${runpath}:${LD_LIBRARY_PATH:-}"
+fi
+
 mkdir -p "${log_dir}"
-log_file="${log_dir}/test_bg_$(date -u +%Y%m%dT%H%M%SZ).log"
+log_prefix="test_bg"
+if [[ -n "${label}" ]]; then
+    log_prefix="test_${label}"
+fi
+log_file="${log_dir}/${log_prefix}_$(date -u +%Y%m%dT%H%M%SZ).log"
 cmd=$(cat <<CMD
-cd "${build_dir}/${build_type}"
-"${test_bin}" "${filter:-[pipnn]}" -v
+cd "${repo_dir}/build/${build_type}"
+"${test_bin}" "${filter:-[pipnn]}"
 CMD
 )
 nohup bash -lc "${cmd}" >"${log_file}" 2>&1 </dev/null &
