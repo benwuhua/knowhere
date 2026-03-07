@@ -22,6 +22,7 @@ class PiPNNDiskANNConfig : public DiskANNConfig {
     CFG_INT pipnn_leaf_max_size;
     CFG_INT pipnn_fanout_l1;
     CFG_INT pipnn_fanout_l2;
+    CFG_INT pipnn_overlap_k;
 
     // HashPrune parameters
     CFG_INT pipnn_k_nn;
@@ -46,6 +47,12 @@ class PiPNNDiskANNConfig : public DiskANNConfig {
         KNOWHERE_CONFIG_DECLARE_FIELD(pipnn_fanout_l2)
             .description("RBC partition fanout at level 2")
             .set_default(3)
+            .set_range(1, 20)
+            .for_train();
+
+        KNOWHERE_CONFIG_DECLARE_FIELD(pipnn_overlap_k)
+            .description("RBC overlap assignments per point")
+            .set_default(2)
             .set_range(1, 20)
             .for_train();
 

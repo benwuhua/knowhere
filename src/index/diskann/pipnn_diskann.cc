@@ -343,6 +343,12 @@ PiPNNDiskANNIndexNode<DataType>::Build(const DataSetPtr dataset, std::shared_ptr
     pipnn_cfg.leaf_max_size = static_cast<size_t>(build_conf.pipnn_leaf_max_size.value());
     pipnn_cfg.fanout_l1 = static_cast<uint32_t>(build_conf.pipnn_fanout_l1.value());
     pipnn_cfg.fanout_l2 = static_cast<uint32_t>(build_conf.pipnn_fanout_l2.value());
+    pipnn_cfg.overlap_k = static_cast<uint32_t>(build_conf.pipnn_overlap_k.value());
+
+    LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Tuning config: leaf_max_size=" << pipnn_cfg.leaf_max_size
+                       << ", fanout_l1=" << pipnn_cfg.fanout_l1 << ", fanout_l2=" << pipnn_cfg.fanout_l2
+                       << ", overlap_k=" << pipnn_cfg.overlap_k << ", k_nn=" << pipnn_cfg.k_nn
+                       << ", hash_bits=" << pipnn_cfg.hash_bits << ", final_prune=" << pipnn_cfg.final_prune;
 
     pipnn_diskann::BuildProfile build_profile;
     const auto graph_stage_start = clock::now();

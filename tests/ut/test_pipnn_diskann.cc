@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -55,6 +56,15 @@ constexpr uint32_t kE2ENumRows = 1000000;
 constexpr uint32_t kE2EDim = 128;
 constexpr uint32_t kE2ENumQueries = 100;
 constexpr uint32_t kE2EK = 10;
+
+struct PiPNNRecallTuningConfig {
+    uint32_t leaf_max_size = 1000;
+    uint32_t fanout_l1 = 10;
+    uint32_t fanout_l2 = 3;
+    uint32_t overlap_k = 2;
+    uint32_t k_nn = 3;
+    uint32_t hash_bits = 12;
+};
 
 std::vector<float>
 RandVec(uint32_t dim, std::mt19937& rng) {
@@ -115,6 +125,52 @@ MakeBuildJson(const std::string& index_prefix, const std::string& data_path, con
     return json;
 }
 
+uint32_t
+GetEnvUintOrDefault(const char* key, uint32_t default_value) {
+    const char* raw = std::getenv(key);
+    if (raw == nullptr || *raw == '\0') {
+        return default_value;
+    }
+
+    char* end = nullptr;
+    const auto parsed = std::strtoul(raw, &end, 10);
+    if (end == raw || *end != '\0' || parsed > std::numeric_limits<uint32_t>::max()) {
+        INFO("Ignoring invalid env override for " << key << ": " << raw);
+        return default_value;
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
+PiPNNRecallTuningConfig
+LoadPiPNNRecallTuningFromEnv() {
+    PiPNNRecallTuningConfig config;
+    config.leaf_max_size = GetEnvUintOrDefault("KNOWHERE_PIPNN_LEAF_MAX_SIZE", config.leaf_max_size);
+    config.fanout_l1 = GetEnvUintOrDefault("KNOWHERE_PIPNN_FANOUT_L1", config.fanout_l1);
+    config.fanout_l2 = GetEnvUintOrDefault("KNOWHERE_PIPNN_FANOUT_L2", config.fanout_l2);
+    config.overlap_k = GetEnvUintOrDefault("KNOWHERE_PIPNN_OVERLAP_K", config.overlap_k);
+    config.k_nn = GetEnvUintOrDefault("KNOWHERE_PIPNN_K_NN", config.k_nn);
+    config.hash_bits = GetEnvUintOrDefault("KNOWHERE_PIPNN_HASH_BITS", config.hash_bits);
+    return config;
+}
+
+void
+ApplyPiPNNRecallTuning(knowhere::Json& build_json, const PiPNNRecallTuningConfig& config) {
+    build_json["pipnn_leaf_max_size"] = config.leaf_max_size;
+    build_json["pipnn_fanout_l1"] = config.fanout_l1;
+    build_json["pipnn_fanout_l2"] = config.fanout_l2;
+    build_json["pipnn_overlap_k"] = config.overlap_k;
+    build_json["pipnn_k_nn"] = config.k_nn;
+    build_json["pipnn_hash_bits"] = config.hash_bits;
+}
+
+std::string
+DescribePiPNNRecallTuning(const PiPNNRecallTuningConfig& config) {
+    return "leaf_max_size=" + std::to_string(config.leaf_max_size) + ", fanout_l1=" +
+           std::to_string(config.fanout_l1) + ", fanout_l2=" + std::to_string(config.fanout_l2) +
+           ", overlap_k=" + std::to_string(config.overlap_k) + ", k_nn=" + std::to_string(config.k_nn) +
+           ", hash_bits=" + std::to_string(config.hash_bits);
+}
+
 knowhere::Json
 MakeDeserializeJson(const std::string& index_prefix, const uint32_t dim, const uint32_t rows) {
     auto json = MakeBaseJson(dim, kE2EK);
@@ -163,6 +219,26 @@ TEST_CASE("PiPNN build profile separates graph and PQ stages", "[pipnn][profile]
     REQUIRE(profile.stage_ms(BuildStage::kPQAndDiskLayout) == Catch::Approx(875.0));
     REQUIRE(profile.stage_ms(BuildStage::kTotal) == Catch::Approx(1000.0));
     REQUIRE(NsToMs(500000) == Catch::Approx(0.5));
+}
+
+TEST_CASE("PiPNN recall tuning populates build json", "[pipnn][perf]") {
+    PiPNNRecallTuningConfig config;
+    config.leaf_max_size = 768;
+    config.fanout_l1 = 6;
+    config.fanout_l2 = 2;
+    config.overlap_k = 1;
+    config.k_nn = 5;
+    config.hash_bits = 10;
+
+    auto build_json = MakeBuildJson("/tmp/pipnn_perf", "/tmp/raw.bin", kE2EDim, 1000);
+    ApplyPiPNNRecallTuning(build_json, config);
+
+    REQUIRE(build_json["pipnn_leaf_max_size"] == config.leaf_max_size);
+    REQUIRE(build_json["pipnn_fanout_l1"] == config.fanout_l1);
+    REQUIRE(build_json["pipnn_fanout_l2"] == config.fanout_l2);
+    REQUIRE(build_json["pipnn_overlap_k"] == config.overlap_k);
+    REQUIRE(build_json["pipnn_k_nn"] == config.k_nn);
+    REQUIRE(build_json["pipnn_hash_bits"] == config.hash_bits);
 }
 
 TEST_CASE("HashPrune enforces max_degree", "[pipnn][hash_prune]") {
@@ -639,6 +715,8 @@ TEST_CASE("PiPNN vs DiskANN recall@10 comparison", "[pipnn_diskann][e2e][recall]
     auto version = GenTestVersionList();
     std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
     auto diskann_index_pack = knowhere::Pack(file_manager);
+    const auto pipnn_tuning = LoadPiPNNRecallTuningFromEnv();
+    LOG_KNOWHERE_INFO_ << "PiPNN recall tuning overrides: " << DescribePiPNNRecallTuning(pipnn_tuning);
 
     auto build_and_search = [&](const std::string& index_type, const std::string& index_prefix) {
         auto create_res =
@@ -647,6 +725,9 @@ TEST_CASE("PiPNN vs DiskANN recall@10 comparison", "[pipnn_diskann][e2e][recall]
         auto index = create_res.value();
 
         auto build_json = MakeBuildJson(index_prefix, raw_path, kE2EDim, kE2ENumRows);
+        if (index_type == knowhere::IndexEnum::INDEX_PIPNN_DISKANN) {
+            ApplyPiPNNRecallTuning(build_json, pipnn_tuning);
+        }
         const auto start = std::chrono::steady_clock::now();
         REQUIRE(index.Build(nullptr, build_json) == knowhere::Status::success);
         const auto end = std::chrono::steady_clock::now();
