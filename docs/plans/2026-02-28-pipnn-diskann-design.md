@@ -220,5 +220,10 @@ Search / Serialize / Deserialize 与 DiskANNIndexNode 完全相同。
 - 这说明当前最关键的 graph-stage 损失已经从“候选不够强”进一步缩到 **retained adjacency / shared-leaf merge materialization 接缝**；`HashPrune` 与 final prune 都不是当前首要矛盾。
 - 随后的 `retained_degree_limit` off/on Release A/B 已给出 stop/go：repair on 仅把 `graph_direct recall@10` 从 `0.034` 提到 `0.05`、`postprocess recall@10` 从 `0.031` 提到 `0.034`，仍远低于 `0.50` 诊断门槛。
 - 因此 retention seam repair 已被降级为 **弱正信号但主线 no-go**：它说明 retained adjacency 不是完全无关，但不足以作为继续深挖的主收益方向。
-- 当前设计主线必须切回 **boundary / leader bridge 的最小 source-side fallback**，判断 candidate source 补源是否仍有机会把 graph recall 拉回可诊断区间；若该最小 fallback 仍无效，则需要正式记录当前工程约束下 PiPNN 路线的 negative conclusion / fallback path，而不是继续默认论文收益可复现。
+- 随后 `PERF-030` 已回收最小 `boundary / leader bridge` fallback 的终态 Release artifact：`graph_direct/postprocess recall@10` 仍只到 `0.037/0.034`，而 `force_diskann_build_index=0.162`、`diskann_baseline=0.172` 继续稳定。
+- 这说明 source-side fallback 与 retention seam repair 一样，都只停留在诊断失败带；当前没有证据表明再补 1-2 个局部 builder 开关就能把 PiPNN graph 拉回论文要求的可用质量。
+- 因此当前设计主线已从“继续 source-side / retention-side 原型”切换为 **negative conclusion / fallback path 决策**：
+  1. 正式记录当前工程约束下，PiPNN graph build path 未能恢复到 recall-gated 可用区间；
+  2. 若项目仍需保留可交付路径，应优先考虑 fallback build path（例如回退到 native/forced DiskANN build path）而非继续扩 PiPNN 原型；
+  3. 后续如需 benchmark，只应服务于 fallback 结论归档，而不是继续把 PiPNN graph 当作默认主线。
 - 设计约束保持不变：仍优先在 PiPNN 自有 builder/适配层内收敛，不把修改 vendored DiskANN 作为默认路径。
