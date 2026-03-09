@@ -201,3 +201,24 @@ Search / Serialize / Deserialize 与 DiskANNIndexNode 完全相同。
 2. **RBC 单元测试**：验证叶子覆盖率（每点至少出现一次）
 3. **构建对比测试**：相同数据集，PiPNN vs DiskANN 的 10@10 recall 对比
 4. **格式兼容测试**：PiPNN 建图后用 DiskANN Search 加载查询
+
+## 当前性能收敛（2026-03-09）
+
+- 最新阶段级 probe 表明：当前 recall 崩塌的主损失发生在 **leaf candidate generation**，而不是 `HashPrune` 或 final `RobustPrune`。
+- 观测依据：`avg_membership=4` 说明 RBC 覆盖并不稀疏，但 sampled `candidate_exact_topk_overlap` 仅约 `0.36%`；`hash_overlap` 与 `candidate_overlap` 基本一致，`final_prune` 仅带来轻微进一步损耗。
+- 这意味着当前设计虽然完成了“RBC -> leaf GEMM -> HashPrune -> DiskANN postprocess` 的主链路，但与论文目标之间的关键差距已经从“后处理兼容”收敛为“候选源过局部，未能把足够多的真近邻送入后续 prune”。
+- 因此下一阶段主线不再优先微调 prune，而是优先验证更强的 **candidate-source**。
+- 最新收敛（2026-03-09）：`higher per-leaf candidate budget` 已在 PERF-021 中被最小实验反证——它没有提升 sampled overlap，也没有改变 edge insertion 规模，因此不能继续作为主线。
+- 当前设计主线改为：
+  1. 多 leaf 候选聚合 / cross-leaf candidate union
+  2. 最小 leader / boundary bridge 候选来源
+  3. 若 cross-leaf 原型有效，再做 candidate-source 的成本/收益小矩阵
+  4. 若 cross-leaf 仍无效，再补 forced DiskANN / PiPNN 同口径候选源对照
+- 2026-03-09 最新阶段切换：forced DiskANN / PiPNN 同口径对照已经完成，forced DiskANN 分支稳定恢复到 `~0.168`，而 PiPNN `graph_direct recall@10` 仍停在 `0.034~0.035`；同时 `cross_leaf_union` 只把 postprocess recall 从 `0.030` 推到 `0.039`，没有同步抬升 graph 主指标。
+- 结合最新 builder probe：`candidate_exact_topk_overlap=0.0088`、`hash_exact_topk_overlap=0.0177`、`final_prune_exact_topk_overlap=0.00136`，当前设计主线不再适合继续泛化为“更强 candidate-source”，而应先补齐 **shared-leaf merge / bidirectional insertion / final retained adjacency** 的 retention 归因，确认已有候选是否在 builder 内被吞掉。
+- 2026-03-09 进一步收敛：retention probe 代码已落到 `pipnn_builder`，新增 `inserted` / `pre-final retained` 指标与 insertion 结果计数；最新 Release artifact 已回收，显示 `inserted_exact_topk_overlap=0.0142276` 但 `pre_final_retained_exact_topk_overlap=0.0013587`，且 `final_prune_exact_topk_overlap` 与之基本一致。
+- 这说明当前最关键的 graph-stage 损失已经从“候选不够强”进一步缩到 **retained adjacency / shared-leaf merge materialization 接缝**；`HashPrune` 与 final prune 都不是当前首要矛盾。
+- 随后的 `retained_degree_limit` off/on Release A/B 已给出 stop/go：repair on 仅把 `graph_direct recall@10` 从 `0.034` 提到 `0.05`、`postprocess recall@10` 从 `0.031` 提到 `0.034`，仍远低于 `0.50` 诊断门槛。
+- 因此 retention seam repair 已被降级为 **弱正信号但主线 no-go**：它说明 retained adjacency 不是完全无关，但不足以作为继续深挖的主收益方向。
+- 当前设计主线必须切回 **boundary / leader bridge 的最小 source-side fallback**，判断 candidate source 补源是否仍有机会把 graph recall 拉回可诊断区间；若该最小 fallback 仍无效，则需要正式记录当前工程约束下 PiPNN 路线的 negative conclusion / fallback path，而不是继续默认论文收益可复现。
+- 设计约束保持不变：仍优先在 PiPNN 自有 builder/适配层内收敛，不把修改 vendored DiskANN 作为默认路径。
