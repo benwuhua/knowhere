@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <string_view>
 #include <vector>
