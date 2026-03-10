@@ -268,6 +268,33 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
                        << ", max_membership=" << context.rbc_coverage.max_membership
                        << ", single_membership_nodes=" << context.rbc_coverage.single_membership_nodes;
 
+    // Pre-compute all point sketches using one shared HashPrune instance.
+    // HashPrune with max_degree=1 is used only for compute_sketch; the reservoir
+    // is unused. All instances with same (dim, hash_bits) produce identical
+    // hyperplanes (deterministic seed), so one instance suffices.
+    {
+        const auto sketch_start = clock::now();
+        HashPrune sketch_engine(dim, config_.hash_bits, /*max_degree=*/1);
+        context.global_sketches_flat.resize(static_cast<size_t>(n) * config_.hash_bits);
+        for (uint32_t i = 0; i < n; ++i) {
+            sketch_engine.compute_sketch(data + static_cast<size_t>(i) * dim,
+                                         context.global_sketches_flat.data() + static_cast<size_t>(i) * config_.hash_bits);
+        }
+        const auto sketch_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - sketch_start).count();
+        LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(sketch_ns)
+                           << " ms (Global sketch pre-computation, num_points=" << n
+                           << ", sketch_bytes=" << (context.global_sketches_flat.size() * sizeof(float)) << ")";
+    }
+
+    // Allocate global per-point reservoirs.
+    {
+        context.global_reservoirs.assign(n, HashReservoir(config_.hash_bits, config_.max_degree));
+        const size_t reservoir_bytes = static_cast<size_t>(n) * (static_cast<size_t>(config_.max_degree) * 8 + 16);
+        LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: global reservoirs allocated"
+                           << ", num_points=" << n
+                           << ", reservoir_mb=" << (reservoir_bytes / (1024 * 1024));
+    }
+
     const bool enable_cross_leaf_union = cross_leaf_union_enabled(config_);
     const bool enable_boundary_leader_bridge = boundary_leader_bridge_enabled();
     LOG_KNOWHERE_INFO_ << "[PiPNN Graph Probe] cross_leaf_union_enabled="
@@ -303,6 +330,17 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
                        << " ms (GEMM distance matrix computation, leaves=" << leaves.size() << ")";
     LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(context.hash_prune_total_ns.load())
                        << " ms (HashPrune insertion, leaves=" << leaves.size() << ")";
+
+    // Extract adjacency from global reservoirs.
+    {
+        const auto extract_start = clock::now();
+        for (uint32_t i = 0; i < n; ++i) {
+            context.adjacency[i] = context.global_reservoirs[i].neighbors();
+        }
+        const auto extract_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - extract_start).count();
+        LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(extract_ns)
+                           << " ms (Adjacency extraction from global reservoirs, num_points=" << n << ")";
+    }
 
     if (n > 1) {
         for (uint32_t i = 0; i < n; ++i) {
