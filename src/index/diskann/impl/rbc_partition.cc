@@ -73,20 +73,40 @@ RBCPartitioner::partition_recursive(const float* data, uint32_t dim, const std::
     const uint32_t k = std::max<uint32_t>(1, std::min<uint32_t>(config_.overlap_k, static_cast<uint32_t>(leaders.size())));
     auto buckets = assign_to_k_leaders(data, dim, point_ids, leaders, k);
 
-    bool has_progress = false;
+    // Recurse per bucket. If a bucket made no progress (same size as parent — possible
+    // when overlap_k causes all points to land in one leader's ball), fall back to
+    // split_evenly for that bucket only, to guarantee termination.
+    bool any_non_empty = false;
     for (const auto& bucket : buckets) {
-        if (!bucket.empty() && bucket.size() < point_ids.size()) {
-            has_progress = true;
+        if (!bucket.empty()) {
+            any_non_empty = true;
             break;
         }
     }
-    if (!has_progress) {
-        buckets = split_evenly(point_ids, fanout);
+    if (!any_non_empty) {
+        // All buckets empty (degenerate); split evenly and recurse.
+        for (const auto& sub : split_evenly(point_ids, fanout)) {
+            if (!sub.empty()) {
+                partition_recursive(data, dim, sub, depth + 1, leaves);
+            }
+        }
+        return;
     }
 
     for (const auto& bucket : buckets) {
-        if (!bucket.empty()) {
+        if (bucket.empty()) {
+            continue;
+        }
+        if (bucket.size() < point_ids.size()) {
             partition_recursive(data, dim, bucket, depth + 1, leaves);
+        } else {
+            // No size reduction — all parent points ended up here due to overlap.
+            // Split evenly to guarantee progress and avoid infinite recursion.
+            for (const auto& sub : split_evenly(bucket, fanout)) {
+                if (!sub.empty()) {
+                    partition_recursive(data, dim, sub, depth + 1, leaves);
+                }
+            }
         }
     }
 }
