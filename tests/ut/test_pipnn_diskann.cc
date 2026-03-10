@@ -1242,6 +1242,69 @@ TEST_CASE("VamanaSerializer: find_medoid", "[pipnn][serializer]") {
     REQUIRE(medoid_dist == Catch::Approx(best_dist).epsilon(0.01));
 }
 
+TEST_CASE("HashReservoir: basic insert and capacity", "[pipnn_diskann][unit]") {
+    knowhere::pipnn_diskann::HashReservoir r(12, 4);
+    REQUIRE(r.size() == 0);
+
+    r.insert(10, 0x0001, 1.0f);
+    r.insert(20, 0x0002, 2.0f);
+    r.insert(30, 0x0003, 3.0f);
+    r.insert(40, 0x0004, 4.0f);
+    REQUIRE(r.size() == 4);
+
+    // Reservoir full: new candidate farther than all → rejected
+    r.insert(50, 0x0005, 5.0f);
+    REQUIRE(r.size() == 4);
+
+    // Reservoir full: closer than farthest → replaces farthest
+    r.insert(99, 0x0006, 0.5f);
+    auto neighbors = r.neighbors();
+    REQUIRE(std::find(neighbors.begin(), neighbors.end(), 99u) != neighbors.end());
+    REQUIRE(std::find(neighbors.begin(), neighbors.end(), 40u) == neighbors.end()); // 40 was farthest
+}
+
+TEST_CASE("HashReservoir: hash collision keeps closer candidate", "[pipnn_diskann][unit]") {
+    knowhere::pipnn_diskann::HashReservoir r(12, 8);
+    r.insert(1, 0xABCD, 3.0f);  // first in slot
+    r.insert(2, 0xABCD, 1.0f);  // same hash, closer → replaces
+    r.insert(3, 0xABCD, 5.0f);  // same hash, farther → rejected
+
+    auto neighbors = r.neighbors();
+    REQUIRE(std::find(neighbors.begin(), neighbors.end(), 2u) != neighbors.end());
+    REQUIRE(std::find(neighbors.begin(), neighbors.end(), 1u) == neighbors.end());
+    REQUIRE(std::find(neighbors.begin(), neighbors.end(), 3u) == neighbors.end());
+}
+
+TEST_CASE("HashReservoir: history-independent (order does not matter)", "[pipnn_diskann][unit]") {
+    // Same 5 candidates inserted in two different orders must produce same neighbor set
+    // when reservoir capacity = 4
+    std::vector<std::pair<uint16_t, float>> candidates = {
+        {0x0001, 1.0f}, {0x0002, 2.0f}, {0x0003, 3.0f}, {0x0004, 4.0f}, {0x0005, 0.5f}
+    };
+
+    auto fill = [&](std::vector<std::pair<uint16_t,float>> order) {
+        knowhere::pipnn_diskann::HashReservoir r(12, 4);
+        for (auto [h, d] : order) r.insert(static_cast<uint32_t>(h), h, d);
+        auto n = r.neighbors();
+        std::sort(n.begin(), n.end());
+        return n;
+    };
+
+    auto fwd = fill(candidates);
+    std::vector<std::pair<uint16_t, float>> reversed(candidates.rbegin(), candidates.rend());
+    auto rev = fill(reversed);
+    REQUIRE(fwd == rev);
+}
+
+TEST_CASE("HashPrune residual_hash is static-callable", "[pipnn_diskann][unit]") {
+    // Verify the static overload compiles and agrees with the instance method
+    knowhere::pipnn_diskann::HashPrune hp(128, 12, 32);
+    std::vector<float> sp(12, 0.0f), sc(12, 1.0f);
+    uint16_t h_instance = hp.residual_hash(sp.data(), sc.data());
+    uint16_t h_static   = knowhere::pipnn_diskann::HashPrune::residual_hash(sp.data(), sc.data(), 12);
+    REQUIRE(h_instance == h_static);
+}
+
 #ifdef KNOWHERE_WITH_PIPNN
 TEST_CASE("PiPNNDiskANNIndexNode build+search full pipeline", "[pipnn_diskann][e2e]") {
     ScopedTempDir temp_dir("knowhere_pipnn_e2e");

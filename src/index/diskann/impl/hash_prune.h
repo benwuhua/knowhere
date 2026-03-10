@@ -63,13 +63,19 @@ class HashPrune {
 
     // residual_hash: m-bit hash of (c - p) using sketch difference
     // sketch_p = compute_sketch(p), sketch_c = compute_sketch(c)
-    uint16_t residual_hash(const float* sketch_p, const float* sketch_c) const {
+
+    // Static overload — callable without a HashPrune instance
+    static uint16_t residual_hash(const float* sketch_p, const float* sketch_c, uint32_t m) {
         uint16_t h = 0;
-        for (uint32_t i = 0; i < m_ && i < 16; i++) {
-            // Sign of (sketch_c[i] - sketch_p[i]) == sign of H_i · (c - p)
+        for (uint32_t i = 0; i < m && i < 16; i++) {
             if (sketch_c[i] >= sketch_p[i]) h |= (1u << i);
         }
         return h;
+    }
+
+    // Instance method — delegates to static for backward compat
+    uint16_t residual_hash(const float* sketch_p, const float* sketch_c) const {
+        return residual_hash(sketch_p, sketch_c, m_);
     }
 
     // insert: stream candidate (candidate_id, dist from p) into reservoir.
@@ -169,6 +175,82 @@ class HashPrune {
         float f;
         std::memcpy(&f, &bits, sizeof(f));
         return f;
+    }
+};
+
+// HashReservoir: per-point global candidate reservoir.
+// Same cone-pruning logic as HashPrune but no hyperplane storage.
+// Caller provides pre-computed residual hash via HashPrune::residual_hash().
+// Memory: max_degree * 8 bytes + 16 bytes overhead per point.
+class HashReservoir {
+ public:
+    HashReservoir() = default;
+    HashReservoir(uint32_t hash_bits, uint32_t max_degree)
+        : m_(hash_bits), max_degree_(max_degree), size_(0), farthest_idx_(0), farthest_dist_(0.0f) {
+        reservoir_.resize(max_degree_);
+    }
+
+    // Insert candidate with pre-computed residual hash and L2 distance.
+    // Returns true if candidate was accepted into the reservoir.
+    bool insert(uint32_t candidate_id, uint16_t hash, float dist) {
+        const uint16_t dist_bf = float_to_bfloat16(dist);
+
+        for (uint32_t i = 0; i < size_; i++) {
+            if (reservoir_[i].hash == hash) {
+                if (dist < bfloat16_to_float(reservoir_[i].dist_bf)) {
+                    reservoir_[i] = {candidate_id, hash, dist_bf};
+                    if (i == farthest_idx_) recompute_farthest();
+                    return true;
+                }
+                return false;
+            }
+        }
+        if (size_ < max_degree_) {
+            reservoir_[size_] = {candidate_id, hash, dist_bf};
+            if (dist > farthest_dist_) { farthest_dist_ = dist; farthest_idx_ = size_; }
+            size_++;
+            return true;
+        }
+        if (dist < farthest_dist_) {
+            reservoir_[farthest_idx_] = {candidate_id, hash, dist_bf};
+            recompute_farthest();
+            return true;
+        }
+        return false;
+    }
+
+    std::vector<uint32_t> neighbors() const {
+        std::vector<uint32_t> result(size_);
+        for (uint32_t i = 0; i < size_; i++) result[i] = reservoir_[i].id;
+        return result;
+    }
+
+    uint32_t size() const { return size_; }
+
+ private:
+    struct Slot { uint32_t id = 0; uint16_t hash = 0; uint16_t dist_bf = 0; };
+
+    uint32_t m_ = 0;
+    uint32_t max_degree_ = 0;
+    uint32_t size_ = 0;
+    uint32_t farthest_idx_ = 0;
+    float farthest_dist_ = 0.0f;
+    std::vector<Slot> reservoir_;
+
+    void recompute_farthest() {
+        farthest_dist_ = 0.0f;
+        farthest_idx_ = 0;
+        for (uint32_t i = 0; i < size_; i++) {
+            const float d = bfloat16_to_float(reservoir_[i].dist_bf);
+            if (d > farthest_dist_) { farthest_dist_ = d; farthest_idx_ = i; }
+        }
+    }
+
+    static uint16_t float_to_bfloat16(float f) {
+        uint32_t bits; std::memcpy(&bits, &f, sizeof(bits)); return static_cast<uint16_t>(bits >> 16);
+    }
+    static float bfloat16_to_float(uint16_t bf) {
+        uint32_t bits = static_cast<uint32_t>(bf) << 16; float f; std::memcpy(&f, &bits, sizeof(f)); return f;
     }
 };
 
