@@ -61,10 +61,10 @@ RBCPartitioner::partition_recursive(const float* data, uint32_t dim, const std::
         leaders_to_sample =
             std::min<uint32_t>(leaders_to_sample, static_cast<uint32_t>(point_ids.size() - 1));
     }
+    // Use all effective_num_leaders leaders as partition centers (RBC guarantee requires
+    // ~√n leaders so that true neighbors co-occur in the same ball with high probability).
+    // Do NOT truncate to fanout — the fanout parameter controls the split_evenly fallback only.
     auto leaders = sample_leaders(point_ids, leaders_to_sample, config_.base_seed + static_cast<uint32_t>(depth));
-    if (leaders.size() > fanout) {
-        leaders.resize(fanout);
-    }
     if (leaders.empty()) {
         leaves.push_back(Leaf{point_ids});
         return;
