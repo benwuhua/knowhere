@@ -140,6 +140,15 @@ class PiPNNBuilder {
         std::atomic<int64_t> edge_lock_contention_count;
         std::atomic<uint32_t> processed_leaves;
         std::vector<uint32_t> membership_counts;
+
+        // Global per-point sketches: flat layout [point_id * hash_bits + bit_idx]
+        // Populated in build() before leaf processing. Size = n * hash_bits.
+        std::vector<float> global_sketches_flat;
+
+        // Global per-point reservoirs for the new streaming path.
+        // Populated in build(). Size = n. Each reservoir is protected by node_locks[i].
+        std::vector<HashReservoir> global_reservoirs;
+
         std::vector<std::vector<uint32_t>> point_to_leaf_ids;
         const std::vector<Leaf>* leaves = nullptr;
         RbcCoverageStats rbc_coverage;
