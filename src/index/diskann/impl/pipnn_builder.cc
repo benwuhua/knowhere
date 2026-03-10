@@ -557,15 +557,6 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
     context.gemm_total_ns.fetch_add(gemm_ns, std::memory_order_relaxed);
 
     const bool enable_cross_leaf_union = cross_leaf_union_enabled(config_);
-    const uint32_t build_degree_limit = retained_degree_limit(config_);
-
-    HashPrune sketcher(dim, config_.hash_bits, config_.max_degree);
-    std::vector<std::vector<float>> sketches(leaf_size, std::vector<float>(config_.hash_bits));
-    for (uint32_t local_id = 0; local_id < leaf_size; ++local_id) {
-        const uint32_t global_id = leaf.point_ids[local_id];
-        const float* vec = data + static_cast<size_t>(global_id) * dim;
-        sketcher.compute_sketch(vec, sketches[local_id].data());
-    }
 
     for (uint32_t i = 0; i < leaf_size; ++i) {
         const uint32_t global_i = leaf.point_ids[i];
@@ -713,87 +704,38 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
                 static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, candidate_ids)), std::memory_order_relaxed);
         }
 
-        HashPrune prune(dim, config_.hash_bits, config_.max_degree);
+        // Stream candidates into global_reservoirs[global_i] under per-point lock.
+        // Bidirectionality emerges naturally: when point j is processed as point i
+        // in another iteration of this same loop, it also streams its candidates
+        // (including i) into global_reservoirs[j].
+        const float* sketch_i = context.global_sketches_flat.data() +
+                                static_cast<size_t>(global_i) * config_.hash_bits;
         const auto hash_prune_insert_start = clock::now();
         for (const auto& candidate : candidates) {
             const uint32_t global_j = candidate.second;
             const float dist = std::max(0.0f, candidate.first);
-            std::vector<float> sketch_j(config_.hash_bits);
-            sketcher.compute_sketch(data + static_cast<size_t>(global_j) * dim, sketch_j.data());
-            const auto decision = prune.insert_with_decision(global_j, sketches[i].data(), sketch_j.data(), dist);
-            switch (decision) {
-                case HashPrune::InsertDecision::kCollisionReplace:
-                    context.quality_probe.collision_replace.fetch_add(1, std::memory_order_relaxed);
-                    break;
-                case HashPrune::InsertDecision::kCollisionReject:
-                    context.quality_probe.collision_reject.fetch_add(1, std::memory_order_relaxed);
-                    break;
-                case HashPrune::InsertDecision::kAppend:
-                    context.quality_probe.append_accept.fetch_add(1, std::memory_order_relaxed);
-                    break;
-                case HashPrune::InsertDecision::kReservoirReplace:
-                    context.quality_probe.reservoir_replace.fetch_add(1, std::memory_order_relaxed);
-                    break;
-                case HashPrune::InsertDecision::kReservoirReject:
-                    context.quality_probe.reservoir_reject.fetch_add(1, std::memory_order_relaxed);
-                    break;
-            }
+            const float* sketch_j = context.global_sketches_flat.data() +
+                                    static_cast<size_t>(global_j) * config_.hash_bits;
+            const uint16_t h = HashPrune::residual_hash(sketch_i, sketch_j, config_.hash_bits);
+
+            std::lock_guard<SpinMutex> lock(context.node_locks[global_i]);
+            context.global_reservoirs[global_i].insert(global_j, h, dist);
         }
         const auto hash_prune_insert_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - hash_prune_insert_start).count();
         context.hash_prune_total_ns.fetch_add(hash_prune_insert_ns, std::memory_order_relaxed);
 
-        const auto pruned_neighbors = prune.neighbors();
         if (probe_node) {
-            context.quality_probe.hash_total.fetch_add(static_cast<int64_t>(pruned_neighbors.size()), std::memory_order_relaxed);
-            context.quality_probe.hash_overlap_hits.fetch_add(
-                static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, pruned_neighbors)), std::memory_order_relaxed);
-        }
-
-        std::vector<uint32_t> inserted_neighbors;
-        if (probe_node) {
-            inserted_neighbors.reserve(pruned_neighbors.size());
-        }
-        for (uint32_t neighbor : pruned_neighbors) {
-            const auto edge_insert_start = clock::now();
-            EdgeLockStats lock_stats;
-            const auto insert_result = insert_bidirectional_edge(global_i,
-                                                                 neighbor,
-                                                                 context.adjacency,
-                                                                 context.node_locks.get(),
-                                                                 build_degree_limit,
-                                                                 &lock_stats);
-            const auto edge_insert_ns =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - edge_insert_start).count();
-            context.edge_insert_ns.fetch_add(edge_insert_ns, std::memory_order_relaxed);
-            context.edge_insert_count.fetch_add(1, std::memory_order_relaxed);
-            context.edge_lock_wait_ns.fetch_add(lock_stats.wait_ns, std::memory_order_relaxed);
-            if (lock_stats.contended) {
-                context.edge_lock_contention_count.fetch_add(1, std::memory_order_relaxed);
+            // Count how many candidates were accepted into the global reservoir so far
+            // (approximate — read under no lock, benign for diagnostics)
+            const auto current_neighbors = context.global_reservoirs[global_i].neighbors();
+            context.quality_probe.inserted_total.fetch_add(
+                static_cast<int64_t>(current_neighbors.size()), std::memory_order_relaxed);
+            if (!exact_topk.empty()) {
+                context.quality_probe.inserted_overlap_hits.fetch_add(
+                    static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, current_neighbors)),
+                    std::memory_order_relaxed);
             }
-
-            if (probe_node) {
-                switch (insert_result.forward) {
-                    case NeighborInsertResult::kAppend:
-                        context.quality_probe.insert_append.fetch_add(1, std::memory_order_relaxed);
-                        inserted_neighbors.push_back(neighbor);
-                        break;
-                    case NeighborInsertResult::kDuplicate:
-                        context.quality_probe.insert_duplicate.fetch_add(1, std::memory_order_relaxed);
-                        break;
-                    case NeighborInsertResult::kDegreeFull:
-                        context.quality_probe.insert_degree_full.fetch_add(1, std::memory_order_relaxed);
-                        break;
-                }
-            }
-        }
-
-        if (probe_node) {
-            context.quality_probe.inserted_total.fetch_add(static_cast<int64_t>(inserted_neighbors.size()),
-                                                          std::memory_order_relaxed);
-            context.quality_probe.inserted_overlap_hits.fetch_add(
-                static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, inserted_neighbors)),
-                std::memory_order_relaxed);
         }
     }
     const auto leaf_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - leaf_start).count();
