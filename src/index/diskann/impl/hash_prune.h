@@ -185,8 +185,7 @@ class HashPrune {
 class HashReservoir {
  public:
     HashReservoir() = default;
-    HashReservoir(uint32_t hash_bits, uint32_t max_degree)
-        : m_(hash_bits), max_degree_(max_degree), size_(0), farthest_idx_(0), farthest_dist_(0.0f) {
+    HashReservoir(uint32_t hash_bits, uint32_t max_degree) : m_(hash_bits), max_degree_(max_degree) {
         reservoir_.resize(max_degree_);
     }
 
