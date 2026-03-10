@@ -226,4 +226,44 @@ Search / Serialize / Deserialize 与 DiskANNIndexNode 完全相同。
   1. 正式记录当前工程约束下，PiPNN graph build path 未能恢复到 recall-gated 可用区间；
   2. 若项目仍需保留可交付路径，应优先考虑 fallback build path（例如回退到 native/forced DiskANN build path）而非继续扩 PiPNN 原型；
   3. 后续如需 benchmark，只应服务于 fallback 结论归档，而不是继续把 PiPNN graph 当作默认主线。
+- 2026-03-09 PERF-032 收口后，设计口径进一步固定为：
+  - PiPNN 路线当前 `graph_direct/postprocess recall@10` 处于 `0.03~0.05`，这些结果只能作为**诊断性失败证据**，不能支撑“可用性能实现”结论；
+  - 同口径 `force_diskann_build_index recall@10=0.162`、`diskann_baseline recall@10=0.172` 目前只能视作 **synthetic 场景下的候选参考**，尚不能直接升级为最终 fallback 工程结论；
+  - 因此默认 stop/go 决策应是：停止继续扩 source / retention 微原型，把 PiPNN graph build path 从默认主线降级为已记录的 negative conclusion；
+  - 仅当最终归档明确需要 appendix 时，再执行 1 组最小 clean fallback benchmark（对应条件任务 `PERF-033`），而不是恢复 PiPNN graph 主线实验。
+- 但该规则有一个前提：**参考路径自身必须足够强。**
+  - 若 native/forced DiskANN 在某一测试场景下自身也低于 `recall@10 >= 0.80` 的可信区间，则该场景只能作为弱参考诊断场景；
+  - 弱参考场景可以说明“PiPNN 比参考更差”，但不足以单独支撑方法级 negative conclusion；
+  - 这种情况下应优先补“提升参考场景有效性/口径可信度”的任务，而不是继续沿用该场景做最终 stop/go。
 - 设计约束保持不变：仍优先在 PiPNN 自有 builder/适配层内收敛，不把修改 vendored DiskANN 作为默认路径。
+- 2026-03-09 PERF-033 阶段补充：当前 benchmark-validity 主线固定为“先 public dataset，再谈 fallback appendix”。
+  - 已确认论文正式 benchmark 数据集至少包括 `OpenAI-ArXiv (1M, 1536d, L2)` 与 `Wikipedia-Cohere (35M, 768d, MIPS)`；
+  - 当前实现侧已具备外部 `fbin/query/gt` public-dataset 入口，因此新的主 blocker 不是测试接缝，而是**缺少 paper-dataset clean artifact**；
+  - 在当前远端仅 `32G RAM` 的约束下，本阶段默认优先 `Wikipedia-Cohere` 的 **1M 公共子集**：它来自论文正式数据系，数据规模可控，且可直接复用现有外部 `fbin/query/gt` 入口；全量 `Wikipedia-Cohere` 与更重的 `OpenAI-ArXiv` 下载都后置；
+  - `simplewiki-openai` 之类公开数据只允许作为 smoke/接缝验证，不允许单独支撑 fallback stop/go 或 negative conclusion；
+  - `Cohere 1M` 的执行入口在本阶段先固定为：`label=wikipedia-cohere-1m-ip`，远端目录 `/data/work/datasets/wikipedia-cohere-1m/{base.fbin,query.fbin,gt.ibin}`；其中 `base.fbin` 通过对论文官方 `wikipedia_base.bin` 做前缀裁切并回写 1M header 得到，`query.fbin/gt.ibin` 直接复用官方 `wikipedia_query.bin` 与 `wikipedia-1M`；后续 recall 统一通过 `KNOWHERE_PIPNN_BASE_FBIN / KNOWHERE_PIPNN_QUERY_FBIN / KNOWHERE_PIPNN_GT_IBIN / KNOWHERE_PIPNN_DATASET_LABEL` 注入，不再在测试代码里硬编码数据源；
+  - Clean benchmark 命令固定为：`KNOWHERE_PIPNN_BASE_FBIN=/data/work/datasets/wikipedia-cohere-1m/base.fbin KNOWHERE_PIPNN_QUERY_FBIN=/data/work/datasets/wikipedia-cohere-1m/query.fbin KNOWHERE_PIPNN_GT_IBIN=/data/work/datasets/wikipedia-cohere-1m/gt.ibin KNOWHERE_PIPNN_DATASET_LABEL=wikipedia-cohere-1m-ip ./scripts/remote/test.sh --type Release --filter '[pipnn_diskann][e2e][recall]'`；
+  - 若 `Cohere 1M` 上 native/forced baseline 自身仍 `< 0.80`，则必须把该场景继续降级为弱参考，并追加 benchmark-validity 任务，而不是直接封口。
+  - 2026-03-09 最新收敛：首个 `Cohere 1M` clean run `test_20260309T102701Z_77399` 曾暴露 forced DiskANN build path 的 sample-data artifact integrity / handoff 故障；随后 `src/index/diskann/pipnn_diskann.cc` 已把 sample-query cache 与 warmup sample 的消费侧失败降级为告警继续，说明 blocker 已不再是“sample_data 一坏整轮 baseline 必挂”。
+  - 当前更具体的 blocker 是 **远端 Release recall active-run hygiene / orchestration 冲突**：目标最小 rerun `test_20260309T120408Z_35719` 在测试入口即返回 `status=conflict`，因为旧的 active run `test_20260309T114120Z_21797` 仍占用同一 Release recall slot；回收日志确认它是 synthetic_diag 旧任务，而非本轮 Cohere-1M clean rerun。
+  - 因此 `PERF-033.3` 的下一动作必须先处理 active run / lock hygiene，清空 Release recall slot，再重跑最小 clean Cohere-1M recall；在真正回收到 native/forced baseline 终态指标前，`Cohere 1M` 仍既不能被标成 trusted reference，也不能被标成 weak reference。
+
+## 未来研究复活条件
+
+当前设计文档保留一条明确边界：
+- **默认工程主线** 已切到 negative conclusion + fallback build path；
+- **未来研究复活** 只在额外条件满足时才重启，不应自动回流到日常性能 backlog。
+
+如果未来需要重新挑战论文路线，优先级建议如下：
+1. **oracle candidate source 对照**
+   - 用 oracle/近 oracle 候选送入 HashPrune，确认问题到底在 source 还是 merge/materialization。
+2. **更强的 leader / boundary bridge 原型**
+   - 当前最小 fallback 已判定 no-go；若复活，必须是更强结构原型，而不是继续微调局部开关。
+3. **更大 leaf / overlap / fanout 的成本-收益矩阵**
+   - 只在接受更高 graph build 成本的研究模式下执行。
+4. **更深的 graph import / DiskANN handoff 实验**
+   - 这一步意味着不再把“不修改 vendored DiskANN”当绝对约束，而是作为新的研究分支立项。
+
+这些方向的共通前提是：
+- 结果必须先跨过 recall-gated 可讨论区间，至少进入 `recall@10 >= 0.50` 的诊断有效带；
+- 在达到 `>= 0.80` 之前，所有结果都只能作为诊断证据，不能写成性能收益或可交付结论。

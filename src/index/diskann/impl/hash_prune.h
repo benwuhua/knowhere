@@ -28,6 +28,14 @@ namespace knowhere::pipnn_diskann {
 // Total: 8 * max_degree bytes per point
 class HashPrune {
  public:
+    enum class InsertDecision {
+        kCollisionReplace,
+        kCollisionReject,
+        kAppend,
+        kReservoirReplace,
+        kReservoirReject,
+    };
+
     HashPrune(uint32_t dim, uint32_t hash_bits, uint32_t max_degree)
         : dim_(dim), m_(hash_bits), max_degree_(max_degree) {
         reservoir_.resize(max_degree_);
@@ -69,6 +77,11 @@ class HashPrune {
     // sketch_c = pre-computed sketch of candidate c
     // Returns true if candidate was accepted.
     bool insert(uint32_t candidate_id, const float* sketch_p, const float* sketch_c, float dist) {
+        const auto decision = insert_with_decision(candidate_id, sketch_p, sketch_c, dist);
+        return decision != InsertDecision::kCollisionReject && decision != InsertDecision::kReservoirReject;
+    }
+
+    InsertDecision insert_with_decision(uint32_t candidate_id, const float* sketch_p, const float* sketch_c, float dist) {
         uint16_t h = residual_hash(sketch_p, sketch_c);
         uint16_t dist_bf = float_to_bfloat16(dist);
 
@@ -80,9 +93,9 @@ class HashPrune {
                     reservoir_[i].dist_bf = dist_bf;
                     // Recompute farthest if we replaced it
                     if (i == farthest_idx_) recompute_farthest();
-                    return true;
+                    return InsertDecision::kCollisionReplace;
                 }
-                return false;  // farther than existing in this bucket
+                return InsertDecision::kCollisionReject;
             }
         }
 
@@ -94,16 +107,16 @@ class HashPrune {
                 farthest_idx_ = size_;
             }
             size_++;
-            return true;
+            return InsertDecision::kAppend;
         }
 
         // Case 3: no collision, reservoir full — replace farthest if closer
         if (dist < farthest_dist_) {
             reservoir_[farthest_idx_] = {candidate_id, h, dist_bf};
             recompute_farthest();
-            return true;
+            return InsertDecision::kReservoirReplace;
         }
-        return false;
+        return InsertDecision::kReservoirReject;
     }
 
     // Return final neighbor IDs

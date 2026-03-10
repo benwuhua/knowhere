@@ -77,7 +77,7 @@ remote_target() {
 }
 
 ssh_base_args() {
-    SSH_BASE_ARGS=(-o StrictHostKeyChecking=accept-new -p "${REMOTE_PORT}")
+    SSH_BASE_ARGS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -p "${REMOTE_PORT}")
     if [[ -n "${SSH_IDENTITY_FILE}" ]]; then
         SSH_BASE_ARGS+=(-i "${SSH_IDENTITY_FILE}" -o IdentitiesOnly=yes)
     fi

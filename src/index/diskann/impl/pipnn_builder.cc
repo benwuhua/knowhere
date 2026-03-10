@@ -14,8 +14,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <string_view>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -34,6 +36,17 @@ using RowMajorMatrixXf = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Ei
 struct EdgeLockStats {
     int64_t wait_ns = 0;
     bool contended = false;
+};
+
+enum class NeighborInsertResult {
+    kAppend,
+    kDuplicate,
+    kDegreeFull,
+};
+
+struct BidirectionalInsertResult {
+    NeighborInsertResult forward = NeighborInsertResult::kAppend;
+    NeighborInsertResult reverse = NeighborInsertResult::kAppend;
 };
 
 class NodeLockGuard {
@@ -78,22 +91,24 @@ class NodeLockGuard {
     SpinMutex* second_;
 };
 
-void
+NeighborInsertResult
 insert_neighbor(std::vector<uint32_t>& neighbors, uint32_t dst, uint32_t max_degree) {
     if (std::find(neighbors.begin(), neighbors.end(), dst) != neighbors.end()) {
-        return;
+        return NeighborInsertResult::kDuplicate;
     }
     if (neighbors.size() < max_degree) {
         neighbors.push_back(dst);
+        return NeighborInsertResult::kAppend;
     }
+    return NeighborInsertResult::kDegreeFull;
 }
 
-void
+BidirectionalInsertResult
 insert_bidirectional_edge(uint32_t u, uint32_t v, std::vector<std::vector<uint32_t>>& adjacency,
                           SpinMutex* node_locks, uint32_t max_degree,
                           EdgeLockStats* lock_stats = nullptr) {
     if (u == v) {
-        return;
+        return {};
     }
 
     EdgeLockStats local_stats;
@@ -101,8 +116,10 @@ insert_bidirectional_edge(uint32_t u, uint32_t v, std::vector<std::vector<uint32
     const uint32_t first_id = std::min(u, v);
     const uint32_t second_id = std::max(u, v);
     NodeLockGuard guard(node_locks[first_id], &node_locks[second_id], stats);
-    insert_neighbor(adjacency[u], v, max_degree);
-    insert_neighbor(adjacency[v], u, max_degree);
+    BidirectionalInsertResult result;
+    result.forward = insert_neighbor(adjacency[u], v, max_degree);
+    result.reverse = insert_neighbor(adjacency[v], u, max_degree);
+    return result;
 }
 
 void
@@ -111,6 +128,85 @@ dedup_and_drop_self(uint32_t self_id, std::vector<uint32_t>& neighbors) {
     std::sort(neighbors.begin(), neighbors.end());
     neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
 }
+
+bool
+should_probe_node(uint32_t global_id) {
+    return global_id < 8 || global_id % 65536 == 0;
+}
+
+size_t
+count_overlap_with_exact_topk(const std::vector<std::pair<float, uint32_t>>& exact_topk, const std::vector<uint32_t>& ids) {
+    size_t hits = 0;
+    for (uint32_t id : ids) {
+        hits += std::find_if(exact_topk.begin(), exact_topk.end(), [&](const auto& item) { return item.second == id; }) !=
+                        exact_topk.end()
+                    ? 1
+                    : 0;
+    }
+    return hits;
+}
+
+uint32_t
+candidate_budget_for_leaf(const PiPNNBuilder::Config& config, uint32_t leaf_size) {
+    if (leaf_size <= 1) {
+        return 0;
+    }
+
+    const uint32_t leaf_cap = leaf_size - 1;
+    const uint32_t overlap_multiplier = std::max<uint32_t>(2, config.overlap_k);
+    const uint32_t expanded_budget = std::max<uint32_t>(config.k_nn, config.k_nn * overlap_multiplier);
+    const uint32_t bounded_budget = std::min<uint32_t>(leaf_cap, std::max<uint32_t>(config.max_degree * 2, expanded_budget));
+    return std::max<uint32_t>(config.k_nn, bounded_budget);
+}
+
+uint32_t
+cross_leaf_budget(const PiPNNBuilder::Config& config) {
+    return std::max<uint32_t>(config.k_nn, std::min<uint32_t>(config.max_degree, config.k_nn * 2));
+}
+
+bool
+retained_degree_limit_enabled() {
+    const char* raw = std::getenv("KNOWHERE_PIPNN_ENABLE_RETAINED_DEGREE_LIMIT");
+    if (raw == nullptr || raw[0] == '\0') {
+        return true;
+    }
+    return std::string_view(raw) != "0" && std::string_view(raw) != "false" && std::string_view(raw) != "FALSE";
+}
+
+uint32_t
+retained_degree_limit(const PiPNNBuilder::Config& config) {
+    if (!config.final_prune || !retained_degree_limit_enabled()) {
+        return config.max_degree;
+    }
+
+    const uint64_t expanded_limit = static_cast<uint64_t>(config.max_degree) * 2;
+    return static_cast<uint32_t>(std::max<uint64_t>(config.max_degree, expanded_limit));
+}
+
+bool
+cross_leaf_union_enabled(const PiPNNBuilder::Config& config) {
+    const char* raw = std::getenv("KNOWHERE_PIPNN_ENABLE_CROSS_LEAF_UNION");
+    if (raw == nullptr || raw[0] == '\0') {
+        return config.enable_cross_leaf_union;
+    }
+    return std::string_view(raw) != "0" && std::string_view(raw) != "false" && std::string_view(raw) != "FALSE";
+}
+
+bool
+boundary_leader_bridge_enabled() {
+    const char* raw = std::getenv("KNOWHERE_PIPNN_ENABLE_BOUNDARY_LEADER_BRIDGE");
+    if (raw == nullptr || raw[0] == '\0') {
+        return false;
+    }
+    return std::string_view(raw) != "0" && std::string_view(raw) != "false" && std::string_view(raw) != "FALSE";
+}
+
+uint32_t
+boundary_leader_bridge_budget(const PiPNNBuilder::Config& config) {
+    return std::max<uint32_t>(1, std::min<uint32_t>(config.max_degree / 2, config.k_nn));
+}
+
+constexpr uint32_t kLeafProgressLogInterval = 256;
 
 }  // namespace
 
@@ -132,8 +228,9 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
     const auto ns_to_ms = [](int64_t ns) { return static_cast<double>(ns) / 1e6; };
 
     BuildContext context(n);
+    const uint32_t build_degree_limit = retained_degree_limit(config_);
     for (auto& neighbors : context.adjacency) {
-        neighbors.reserve(config_.max_degree);
+        neighbors.reserve(build_degree_limit);
     }
 
     RBCPartitioner::Config rbc_config;
@@ -149,9 +246,37 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
 
     const auto rbc_start = clock::now();
     const auto leaves = partitioner.partition(data, n, dim);
+    context.leaves = &leaves;
+    context.point_to_leaf_ids.assign(n, {});
+    for (uint32_t leaf_id = 0; leaf_id < leaves.size(); ++leaf_id) {
+        for (uint32_t point_id : leaves[leaf_id].point_ids) {
+            if (point_id < n) {
+                context.point_to_leaf_ids[point_id].push_back(leaf_id);
+            }
+        }
+    }
+    context.rbc_coverage = collect_rbc_coverage_stats(leaves, n);
     const auto rbc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - rbc_start).count();
     LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(rbc_ns)
                        << " ms (RBC partition, leaves=" << leaves.size() << ", num_points=" << n << ")";
+    LOG_KNOWHERE_INFO_ << "[PiPNN Graph Probe] RBC coverage leaves=" << context.rbc_coverage.leaves
+                       << ", avg_leaf_size=" << context.rbc_coverage.avg_leaf_size
+                       << ", min_leaf_size=" << context.rbc_coverage.min_leaf_size
+                       << ", max_leaf_size=" << context.rbc_coverage.max_leaf_size
+                       << ", avg_membership=" << context.rbc_coverage.avg_membership
+                       << ", min_membership=" << context.rbc_coverage.min_membership
+                       << ", max_membership=" << context.rbc_coverage.max_membership
+                       << ", single_membership_nodes=" << context.rbc_coverage.single_membership_nodes;
+
+    const bool enable_cross_leaf_union = cross_leaf_union_enabled(config_);
+    const bool enable_boundary_leader_bridge = boundary_leader_bridge_enabled();
+    LOG_KNOWHERE_INFO_ << "[PiPNN Graph Probe] cross_leaf_union_enabled="
+                       << (enable_cross_leaf_union ? "true" : "false")
+                       << ", sibling_budget=" << (enable_cross_leaf_union ? cross_leaf_budget(config_) : 0)
+                       << ", boundary_leader_bridge_enabled="
+                       << (enable_boundary_leader_bridge ? "true" : "false")
+                       << ", boundary_bridge_budget="
+                       << (enable_boundary_leader_bridge ? boundary_leader_bridge_budget(config_) : 0);
 
     const auto leaf_process_start = clock::now();
 #ifdef _OPENMP
@@ -203,7 +328,7 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
             const auto edge_insert_start = clock::now();
             EdgeLockStats lock_stats;
             insert_bidirectional_edge(
-                i, best_j, context.adjacency, context.node_locks.get(), config_.max_degree, &lock_stats);
+                i, best_j, context.adjacency, context.node_locks.get(), build_degree_limit, &lock_stats);
             const auto edge_insert_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - edge_insert_start).count();
             context.edge_insert_ns.fetch_add(edge_insert_ns, std::memory_order_relaxed);
@@ -215,14 +340,16 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
         }
     }
 
+    collect_pre_final_retained_probe_stats(data, n, dim, context);
     if (config_.final_prune) {
         const auto robust_prune_start = clock::now();
-        robust_prune_pass(data, n, dim, context.adjacency);
+        robust_prune_pass(data, n, dim, context.adjacency, context);
         const auto robust_prune_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - robust_prune_start).count();
         LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(robust_prune_ns)
                            << " ms (Robust prune pass, num_points=" << n << ")";
     }
+    log_quality_probe_stats(context, config_.final_prune);
     LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(context.edge_insert_ns.load())
                        << " ms (Edge insertion, count=" << context.edge_insert_count.load() << ")";
     LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Stage: " << ns_to_ms(context.edge_lock_wait_ns.load())
@@ -231,6 +358,135 @@ PiPNNBuilder::build(const float* data, uint32_t n, uint32_t dim) const {
                        << (static_cast<uint64_t>(sizeof(SpinMutex)) * n) << ")";
 
     return context.adjacency;
+}
+
+PiPNNBuilder::RbcCoverageStats
+PiPNNBuilder::collect_rbc_coverage_stats(const std::vector<Leaf>& leaves, uint32_t n) {
+    RbcCoverageStats stats;
+    stats.leaves = static_cast<uint32_t>(leaves.size());
+    if (leaves.empty() || n == 0) {
+        return stats;
+    }
+
+    std::vector<uint32_t> membership(n, 0);
+    stats.min_leaf_size = std::numeric_limits<uint32_t>::max();
+    for (const auto& leaf : leaves) {
+        const uint32_t leaf_size = static_cast<uint32_t>(leaf.point_ids.size());
+        stats.min_leaf_size = std::min(stats.min_leaf_size, leaf_size);
+        stats.max_leaf_size = std::max(stats.max_leaf_size, leaf_size);
+        stats.avg_leaf_size += static_cast<double>(leaf_size);
+        for (uint32_t id : leaf.point_ids) {
+            if (id < n) {
+                ++membership[id];
+            }
+        }
+    }
+    stats.avg_leaf_size /= static_cast<double>(leaves.size());
+    stats.min_membership = std::numeric_limits<uint32_t>::max();
+    for (uint32_t count : membership) {
+        stats.avg_membership += static_cast<double>(count);
+        stats.min_membership = std::min(stats.min_membership, count);
+        stats.max_membership = std::max(stats.max_membership, count);
+        stats.single_membership_nodes += count == 1 ? 1U : 0U;
+    }
+    stats.avg_membership /= static_cast<double>(n);
+    return stats;
+}
+
+void
+PiPNNBuilder::collect_pre_final_retained_probe_stats(const float* data, uint32_t n, uint32_t dim,
+                                                     BuildContext& context) const {
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!should_probe_node(i)) {
+            continue;
+        }
+
+        const auto& neighbors = context.adjacency[i];
+        context.quality_probe.pre_final_retained_degree.fetch_add(static_cast<int64_t>(neighbors.size()),
+                                                                  std::memory_order_relaxed);
+
+        std::vector<std::pair<float, uint32_t>> exact_topk;
+        exact_topk.reserve(config_.k_nn);
+        const float* query = data + static_cast<size_t>(i) * dim;
+        std::vector<std::pair<float, uint32_t>> global_candidates;
+        global_candidates.reserve(n > 0 ? n - 1 : 0);
+        for (uint32_t other = 0; other < n; ++other) {
+            if (other == i) {
+                continue;
+            }
+            global_candidates.emplace_back(l2sq(query, data + static_cast<size_t>(other) * dim, dim), other);
+        }
+        const uint32_t truth_k = std::min<uint32_t>(config_.k_nn, static_cast<uint32_t>(global_candidates.size()));
+        if (global_candidates.size() > truth_k) {
+            std::nth_element(global_candidates.begin(), global_candidates.begin() + truth_k, global_candidates.end(),
+                             [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+            global_candidates.resize(truth_k);
+        }
+        std::sort(global_candidates.begin(), global_candidates.end(),
+                  [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+        exact_topk = std::move(global_candidates);
+        context.quality_probe.pre_final_retained_total.fetch_add(static_cast<int64_t>(neighbors.size()),
+                                                                 std::memory_order_relaxed);
+        context.quality_probe.pre_final_retained_overlap_hits.fetch_add(
+            static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, neighbors)), std::memory_order_relaxed);
+    }
+}
+
+void
+PiPNNBuilder::log_quality_probe_stats(const BuildContext& context, bool final_prune_enabled) {
+    const double sampled_nodes = static_cast<double>(context.quality_probe.sampled_nodes.load());
+    if (sampled_nodes == 0.0) {
+        LOG_KNOWHERE_INFO_ << "[PiPNN Graph Probe] sampled_nodes=0";
+        return;
+    }
+
+    const double candidate_total = static_cast<double>(context.quality_probe.candidate_total.load());
+    const double hash_total = static_cast<double>(context.quality_probe.hash_total.load());
+    const double inserted_total = static_cast<double>(context.quality_probe.inserted_total.load());
+    const double pre_final_total = static_cast<double>(context.quality_probe.pre_final_retained_total.load());
+    const double final_total = static_cast<double>(context.quality_probe.final_prune_total.load());
+    LOG_KNOWHERE_INFO_ << "[PiPNN Graph Probe] sampled_nodes=" << sampled_nodes
+                       << ", candidate_exact_topk_overlap="
+                       << (candidate_total == 0.0 ? 0.0
+                                                  : static_cast<double>(context.quality_probe.candidate_overlap_hits.load()) /
+                                                        candidate_total)
+                       << ", hash_exact_topk_overlap="
+                       << (hash_total == 0.0 ? 0.0
+                                             : static_cast<double>(context.quality_probe.hash_overlap_hits.load()) /
+                                                   hash_total)
+                       << ", inserted_exact_topk_overlap="
+                       << (inserted_total == 0.0 ? 0.0
+                                                 : static_cast<double>(context.quality_probe.inserted_overlap_hits.load()) /
+                                                       inserted_total)
+                       << ", pre_final_retained_exact_topk_overlap="
+                       << (pre_final_total == 0.0 ? 0.0
+                                                  : static_cast<double>(context.quality_probe.pre_final_retained_overlap_hits.load()) /
+                                                        pre_final_total)
+                       << ", final_prune_exact_topk_overlap="
+                       << (final_total == 0.0 ? 0.0
+                                              : static_cast<double>(context.quality_probe.final_prune_overlap_hits.load()) /
+                                                    final_total)
+                       << ", hash_collision_replace=" << context.quality_probe.collision_replace.load()
+                       << ", hash_collision_reject=" << context.quality_probe.collision_reject.load()
+                       << ", hash_append=" << context.quality_probe.append_accept.load()
+                       << ", hash_reservoir_replace=" << context.quality_probe.reservoir_replace.load()
+                       << ", hash_reservoir_reject=" << context.quality_probe.reservoir_reject.load()
+                       << ", insert_append=" << context.quality_probe.insert_append.load()
+                       << ", insert_duplicate=" << context.quality_probe.insert_duplicate.load()
+                       << ", insert_degree_full=" << context.quality_probe.insert_degree_full.load()
+                       << ", pre_final_retained_avg_degree="
+                       << (sampled_nodes == 0.0 ? 0.0
+                                                : static_cast<double>(context.quality_probe.pre_final_retained_degree.load()) /
+                                                      sampled_nodes)
+                       << ", final_prune_enabled=" << (final_prune_enabled ? "true" : "false")
+                       << ", final_prune_avg_degree_before="
+                       << (sampled_nodes == 0.0 ? 0.0
+                                                : static_cast<double>(context.quality_probe.final_prune_degree_before.load()) /
+                                                      sampled_nodes)
+                       << ", final_prune_avg_degree_after="
+                       << (sampled_nodes == 0.0 ? 0.0
+                                                : static_cast<double>(context.quality_probe.final_prune_degree_after.load()) /
+                                                      sampled_nodes);
 }
 
 void
@@ -262,6 +518,9 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
     const auto gemm_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - gemm_start).count();
     context.gemm_total_ns.fetch_add(gemm_ns, std::memory_order_relaxed);
 
+    const bool enable_cross_leaf_union = cross_leaf_union_enabled(config_);
+    const uint32_t build_degree_limit = retained_degree_limit(config_);
+
     HashPrune sketcher(dim, config_.hash_bits, config_.max_degree);
     std::vector<std::vector<float>> sketches(leaf_size, std::vector<float>(config_.hash_bits));
     for (uint32_t local_id = 0; local_id < leaf_size; ++local_id) {
@@ -271,53 +530,201 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
     }
 
     for (uint32_t i = 0; i < leaf_size; ++i) {
+        const uint32_t global_i = leaf.point_ids[i];
         std::vector<std::pair<float, uint32_t>> candidates;
         candidates.reserve(leaf_size - 1);
         for (uint32_t j = 0; j < leaf_size; ++j) {
             if (i == j) {
                 continue;
             }
-            candidates.emplace_back(d_mat(i, j), j);
+            candidates.emplace_back(d_mat(i, j), leaf.point_ids[j]);
         }
 
-        const uint32_t target_k = std::min<uint32_t>(config_.k_nn, static_cast<uint32_t>(candidates.size()));
-        if (target_k == 0) {
+        const uint32_t local_target_k = std::min<uint32_t>(candidate_budget_for_leaf(config_, leaf_size),
+                                                           static_cast<uint32_t>(candidates.size()));
+        if (local_target_k > 0 && candidates.size() > local_target_k) {
+            std::nth_element(candidates.begin(),
+                             candidates.begin() + local_target_k,
+                             candidates.end(),
+                             [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+            candidates.resize(local_target_k);
+        }
+
+        const auto& shared_leaf_ids = context.point_to_leaf_ids[global_i];
+        const uint32_t sibling_budget = enable_cross_leaf_union ? cross_leaf_budget(config_) : 0;
+        const uint32_t bridge_budget = boundary_leader_bridge_enabled() ? boundary_leader_bridge_budget(config_) : 0;
+        const float* query = data + static_cast<size_t>(global_i) * dim;
+        if (sibling_budget > 0) {
+            for (uint32_t shared_leaf_id : shared_leaf_ids) {
+                const auto& sibling_leaf = (*context.leaves)[shared_leaf_id];
+                if (&sibling_leaf == &leaf || sibling_leaf.point_ids.size() <= 1) {
+                    continue;
+                }
+
+                std::vector<std::pair<float, uint32_t>> sibling_candidates;
+                sibling_candidates.reserve(sibling_leaf.point_ids.size() - 1);
+                for (uint32_t sibling_point : sibling_leaf.point_ids) {
+                    if (sibling_point == global_i) {
+                        continue;
+                    }
+                    sibling_candidates.emplace_back(
+                        l2sq(query, data + static_cast<size_t>(sibling_point) * dim, dim), sibling_point);
+                }
+                const uint32_t take = std::min<uint32_t>(sibling_budget, static_cast<uint32_t>(sibling_candidates.size()));
+                if (take == 0) {
+                    continue;
+                }
+                if (sibling_candidates.size() > take) {
+                    std::nth_element(sibling_candidates.begin(),
+                                     sibling_candidates.begin() + take,
+                                     sibling_candidates.end(),
+                                     [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+                    sibling_candidates.resize(take);
+                }
+                candidates.insert(candidates.end(), sibling_candidates.begin(), sibling_candidates.end());
+            }
+        }
+
+        if (bridge_budget > 0) {
+            const uint32_t local_bridge_seed = std::min<uint32_t>(bridge_budget, static_cast<uint32_t>(candidates.size()));
+            for (uint32_t seed_idx = 0; seed_idx < local_bridge_seed; ++seed_idx) {
+                const uint32_t bridge_seed = candidates[seed_idx].second;
+                for (uint32_t bridge_leaf_id : context.point_to_leaf_ids[bridge_seed]) {
+                    const auto& bridge_leaf = (*context.leaves)[bridge_leaf_id];
+                    if (&bridge_leaf == &leaf || bridge_leaf.point_ids.size() <= 1) {
+                        continue;
+                    }
+
+                    uint32_t best_bridge_point = global_i;
+                    float best_bridge_dist = std::numeric_limits<float>::max();
+                    for (uint32_t bridge_point : bridge_leaf.point_ids) {
+                        if (bridge_point == global_i || bridge_point == bridge_seed) {
+                            continue;
+                        }
+                        const float dist = l2sq(query, data + static_cast<size_t>(bridge_point) * dim, dim);
+                        if (dist < best_bridge_dist) {
+                            best_bridge_dist = dist;
+                            best_bridge_point = bridge_point;
+                        }
+                    }
+                    if (best_bridge_point != global_i) {
+                        candidates.emplace_back(best_bridge_dist, best_bridge_point);
+                    }
+                }
+            }
+        }
+
+        if (candidates.empty()) {
             continue;
         }
 
+        std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.first != rhs.first) {
+                return lhs.first < rhs.first;
+            }
+            return lhs.second < rhs.second;
+        });
+        candidates.erase(std::unique(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+                             return lhs.second == rhs.second;
+                         }),
+                         candidates.end());
+
+        const uint32_t target_k = std::min<uint32_t>(std::max<uint32_t>(local_target_k, sibling_budget),
+                                                     static_cast<uint32_t>(candidates.size()));
+        if (target_k == 0) {
+            continue;
+        }
         if (candidates.size() > target_k) {
-            std::nth_element(candidates.begin(),
-                             candidates.begin() + target_k,
-                             candidates.end(),
-                             [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
             candidates.resize(target_k);
         }
-        std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs.first < rhs.first;
-        });
+
+        const bool probe_node = should_probe_node(global_i);
+        std::vector<std::pair<float, uint32_t>> exact_topk;
+        if (probe_node) {
+            exact_topk.reserve(target_k);
+            const float* query = data + static_cast<size_t>(global_i) * dim;
+            std::vector<std::pair<float, uint32_t>> global_candidates;
+            const uint32_t total_points = static_cast<uint32_t>(context.adjacency.size());
+            global_candidates.reserve(total_points > 0 ? total_points - 1 : 0);
+            for (uint32_t other = 0; other < total_points; ++other) {
+                if (other == global_i) {
+                    continue;
+                }
+                global_candidates.emplace_back(l2sq(query, data + static_cast<size_t>(other) * dim, dim), other);
+            }
+            if (global_candidates.size() > target_k) {
+                std::nth_element(global_candidates.begin(),
+                                 global_candidates.begin() + target_k,
+                                 global_candidates.end(),
+                                 [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+                global_candidates.resize(target_k);
+            }
+            std::sort(global_candidates.begin(), global_candidates.end(), [](const auto& lhs, const auto& rhs) {
+                return lhs.first < rhs.first;
+            });
+            exact_topk = std::move(global_candidates);
+
+            std::vector<uint32_t> candidate_ids;
+            candidate_ids.reserve(candidates.size());
+            for (const auto& candidate : candidates) {
+                candidate_ids.push_back(candidate.second);
+            }
+            context.quality_probe.sampled_nodes.fetch_add(1, std::memory_order_relaxed);
+            context.quality_probe.candidate_total.fetch_add(static_cast<int64_t>(target_k), std::memory_order_relaxed);
+            context.quality_probe.candidate_overlap_hits.fetch_add(
+                static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, candidate_ids)), std::memory_order_relaxed);
+        }
 
         HashPrune prune(dim, config_.hash_bits, config_.max_degree);
         const auto hash_prune_insert_start = clock::now();
         for (const auto& candidate : candidates) {
-            const uint32_t local_j = candidate.second;
-            const uint32_t global_j = leaf.point_ids[local_j];
+            const uint32_t global_j = candidate.second;
             const float dist = std::max(0.0f, candidate.first);
-            prune.insert(global_j, sketches[i].data(), sketches[local_j].data(), dist);
+            std::vector<float> sketch_j(config_.hash_bits);
+            sketcher.compute_sketch(data + static_cast<size_t>(global_j) * dim, sketch_j.data());
+            const auto decision = prune.insert_with_decision(global_j, sketches[i].data(), sketch_j.data(), dist);
+            switch (decision) {
+                case HashPrune::InsertDecision::kCollisionReplace:
+                    context.quality_probe.collision_replace.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case HashPrune::InsertDecision::kCollisionReject:
+                    context.quality_probe.collision_reject.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case HashPrune::InsertDecision::kAppend:
+                    context.quality_probe.append_accept.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case HashPrune::InsertDecision::kReservoirReplace:
+                    context.quality_probe.reservoir_replace.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case HashPrune::InsertDecision::kReservoirReject:
+                    context.quality_probe.reservoir_reject.fetch_add(1, std::memory_order_relaxed);
+                    break;
+            }
         }
         const auto hash_prune_insert_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - hash_prune_insert_start).count();
         context.hash_prune_total_ns.fetch_add(hash_prune_insert_ns, std::memory_order_relaxed);
 
-        const uint32_t global_i = leaf.point_ids[i];
-        for (uint32_t neighbor : prune.neighbors()) {
+        const auto pruned_neighbors = prune.neighbors();
+        if (probe_node) {
+            context.quality_probe.hash_total.fetch_add(static_cast<int64_t>(pruned_neighbors.size()), std::memory_order_relaxed);
+            context.quality_probe.hash_overlap_hits.fetch_add(
+                static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, pruned_neighbors)), std::memory_order_relaxed);
+        }
+
+        std::vector<uint32_t> inserted_neighbors;
+        if (probe_node) {
+            inserted_neighbors.reserve(pruned_neighbors.size());
+        }
+        for (uint32_t neighbor : pruned_neighbors) {
             const auto edge_insert_start = clock::now();
             EdgeLockStats lock_stats;
-            insert_bidirectional_edge(global_i,
-                                      neighbor,
-                                      context.adjacency,
-                                      context.node_locks.get(),
-                                      config_.max_degree,
-                                      &lock_stats);
+            const auto insert_result = insert_bidirectional_edge(global_i,
+                                                                 neighbor,
+                                                                 context.adjacency,
+                                                                 context.node_locks.get(),
+                                                                 build_degree_limit,
+                                                                 &lock_stats);
             const auto edge_insert_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - edge_insert_start).count();
             context.edge_insert_ns.fetch_add(edge_insert_ns, std::memory_order_relaxed);
@@ -326,20 +733,93 @@ PiPNNBuilder::process_leaf(const float* data, uint32_t dim, const Leaf& leaf, Bu
             if (lock_stats.contended) {
                 context.edge_lock_contention_count.fetch_add(1, std::memory_order_relaxed);
             }
+
+            if (probe_node) {
+                switch (insert_result.forward) {
+                    case NeighborInsertResult::kAppend:
+                        context.quality_probe.insert_append.fetch_add(1, std::memory_order_relaxed);
+                        inserted_neighbors.push_back(neighbor);
+                        break;
+                    case NeighborInsertResult::kDuplicate:
+                        context.quality_probe.insert_duplicate.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    case NeighborInsertResult::kDegreeFull:
+                        context.quality_probe.insert_degree_full.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                }
+            }
+        }
+
+        if (probe_node) {
+            context.quality_probe.inserted_total.fetch_add(static_cast<int64_t>(inserted_neighbors.size()),
+                                                          std::memory_order_relaxed);
+            context.quality_probe.inserted_overlap_hits.fetch_add(
+                static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, inserted_neighbors)),
+                std::memory_order_relaxed);
         }
     }
     const auto leaf_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - leaf_start).count();
     context.leaf_total_ns.fetch_add(leaf_ns, std::memory_order_relaxed);
+
+    const uint32_t processed_leaves = context.processed_leaves.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (processed_leaves <= 4 || processed_leaves % kLeafProgressLogInterval == 0) {
+        const auto leaf_elapsed_ms = static_cast<double>(leaf_ns) / 1e6;
+        const auto accumulated_leaf_cpu_ms = static_cast<double>(context.leaf_total_ns.load()) / 1e6;
+        const auto accumulated_gemm_ms = static_cast<double>(context.gemm_total_ns.load()) / 1e6;
+        const auto accumulated_hash_prune_ms = static_cast<double>(context.hash_prune_total_ns.load()) / 1e6;
+        LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Leaf progress processed=" << processed_leaves
+                           << "/" << context.rbc_coverage.leaves
+                           << ", leaf_size=" << leaf_size
+                           << ", leaf_elapsed_ms=" << leaf_elapsed_ms
+                           << ", accumulated_leaf_cpu_ms=" << accumulated_leaf_cpu_ms
+                           << ", accumulated_gemm_ms=" << accumulated_gemm_ms
+                           << ", accumulated_hash_prune_ms=" << accumulated_hash_prune_ms
+                           << ", edge_insert_count=" << context.edge_insert_count.load();
+    }
 }
 
 void
 PiPNNBuilder::robust_prune_pass(const float* data, uint32_t n, uint32_t dim,
-                                std::vector<std::vector<uint32_t>>& adjacency) const {
+                                std::vector<std::vector<uint32_t>>& adjacency, BuildContext& context) const {
     for (uint32_t i = 0; i < n; ++i) {
         auto& neighbors = adjacency[i];
         dedup_and_drop_self(i, neighbors);
+        const auto degree_before = neighbors.size();
+
+        if (should_probe_node(i)) {
+            context.quality_probe.final_prune_degree_before.fetch_add(static_cast<int64_t>(degree_before),
+                                                                     std::memory_order_relaxed);
+        }
 
         if (neighbors.size() <= config_.max_degree) {
+            if (should_probe_node(i)) {
+                context.quality_probe.final_prune_degree_after.fetch_add(static_cast<int64_t>(neighbors.size()),
+                                                                        std::memory_order_relaxed);
+                std::vector<std::pair<float, uint32_t>> exact_topk;
+                exact_topk.reserve(config_.max_degree);
+                const float* query = data + static_cast<size_t>(i) * dim;
+                std::vector<std::pair<float, uint32_t>> global_candidates;
+                global_candidates.reserve(n > 0 ? n - 1 : 0);
+                for (uint32_t other = 0; other < n; ++other) {
+                    if (other == i) {
+                        continue;
+                    }
+                    global_candidates.emplace_back(l2sq(query, data + static_cast<size_t>(other) * dim, dim), other);
+                }
+                const uint32_t truth_k = std::min<uint32_t>(config_.k_nn, static_cast<uint32_t>(global_candidates.size()));
+                if (global_candidates.size() > truth_k) {
+                    std::nth_element(global_candidates.begin(), global_candidates.begin() + truth_k, global_candidates.end(),
+                                     [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+                    global_candidates.resize(truth_k);
+                }
+                std::sort(global_candidates.begin(), global_candidates.end(),
+                          [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+                exact_topk = std::move(global_candidates);
+                context.quality_probe.final_prune_total.fetch_add(static_cast<int64_t>(neighbors.size()),
+                                                                  std::memory_order_relaxed);
+                context.quality_probe.final_prune_overlap_hits.fetch_add(
+                    static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, neighbors)), std::memory_order_relaxed);
+            }
             continue;
         }
 
@@ -354,6 +834,35 @@ PiPNNBuilder::robust_prune_pass(const float* data, uint32_t n, uint32_t dim,
             prune.insert(neighbor, sketch_i.data(), sketch_j.data(), dist);
         }
         neighbors = prune.neighbors();
+
+        if (should_probe_node(i)) {
+            context.quality_probe.final_prune_degree_after.fetch_add(static_cast<int64_t>(neighbors.size()),
+                                                                    std::memory_order_relaxed);
+            std::vector<std::pair<float, uint32_t>> exact_topk;
+            exact_topk.reserve(config_.max_degree);
+            const float* query = data + static_cast<size_t>(i) * dim;
+            std::vector<std::pair<float, uint32_t>> global_candidates;
+            global_candidates.reserve(n > 0 ? n - 1 : 0);
+            for (uint32_t other = 0; other < n; ++other) {
+                if (other == i) {
+                    continue;
+                }
+                global_candidates.emplace_back(l2sq(query, data + static_cast<size_t>(other) * dim, dim), other);
+            }
+            const uint32_t truth_k = std::min<uint32_t>(config_.k_nn, static_cast<uint32_t>(global_candidates.size()));
+            if (global_candidates.size() > truth_k) {
+                std::nth_element(global_candidates.begin(), global_candidates.begin() + truth_k, global_candidates.end(),
+                                 [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+                global_candidates.resize(truth_k);
+            }
+            std::sort(global_candidates.begin(), global_candidates.end(),
+                      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+            exact_topk = std::move(global_candidates);
+            context.quality_probe.final_prune_total.fetch_add(static_cast<int64_t>(neighbors.size()),
+                                                              std::memory_order_relaxed);
+            context.quality_probe.final_prune_overlap_hits.fetch_add(
+                static_cast<int64_t>(count_overlap_with_exact_topk(exact_topk, neighbors)), std::memory_order_relaxed);
+        }
     }
 }
 

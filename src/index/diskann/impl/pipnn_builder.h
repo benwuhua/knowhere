@@ -17,6 +17,8 @@
 #include <thread>
 #include <vector>
 
+#include "knowhere/log.h"
+
 #include "index/diskann/impl/hash_prune.h"
 #include "index/diskann/impl/rbc_partition.h"
 
@@ -65,6 +67,7 @@ class PiPNNBuilder {
         uint32_t fanout_l2 = 4;
         uint32_t fanout_rest = 2;
         uint32_t overlap_k = 2;
+        bool enable_cross_leaf_union = true;
         uint64_t base_seed = 42;
     };
 
@@ -75,6 +78,42 @@ class PiPNNBuilder {
     build(const float* data, uint32_t n, uint32_t dim) const;
 
  private:
+    struct RbcCoverageStats {
+        uint32_t leaves = 0;
+        uint32_t min_leaf_size = 0;
+        uint32_t max_leaf_size = 0;
+        double avg_leaf_size = 0.0;
+        double avg_membership = 0.0;
+        uint32_t min_membership = 0;
+        uint32_t max_membership = 0;
+        uint32_t single_membership_nodes = 0;
+    };
+
+    struct QualityProbeStats {
+        std::atomic<int64_t> sampled_nodes{0};
+        std::atomic<int64_t> candidate_overlap_hits{0};
+        std::atomic<int64_t> hash_overlap_hits{0};
+        std::atomic<int64_t> inserted_overlap_hits{0};
+        std::atomic<int64_t> pre_final_retained_overlap_hits{0};
+        std::atomic<int64_t> final_prune_overlap_hits{0};
+        std::atomic<int64_t> candidate_total{0};
+        std::atomic<int64_t> hash_total{0};
+        std::atomic<int64_t> inserted_total{0};
+        std::atomic<int64_t> pre_final_retained_total{0};
+        std::atomic<int64_t> final_prune_total{0};
+        std::atomic<int64_t> collision_replace{0};
+        std::atomic<int64_t> collision_reject{0};
+        std::atomic<int64_t> append_accept{0};
+        std::atomic<int64_t> reservoir_replace{0};
+        std::atomic<int64_t> reservoir_reject{0};
+        std::atomic<int64_t> insert_append{0};
+        std::atomic<int64_t> insert_duplicate{0};
+        std::atomic<int64_t> insert_degree_full{0};
+        std::atomic<int64_t> pre_final_retained_degree{0};
+        std::atomic<int64_t> final_prune_degree_before{0};
+        std::atomic<int64_t> final_prune_degree_after{0};
+    };
+
     struct BuildContext {
         explicit BuildContext(uint32_t n)
             : adjacency(n),
@@ -85,7 +124,9 @@ class PiPNNBuilder {
               edge_insert_ns(0),
               edge_insert_count(0),
               edge_lock_wait_ns(0),
-              edge_lock_contention_count(0) {
+              edge_lock_contention_count(0),
+              processed_leaves(0),
+              membership_counts(n, 0) {
         }
 
         std::vector<std::vector<uint32_t>> adjacency;
@@ -97,13 +138,29 @@ class PiPNNBuilder {
         std::atomic<int64_t> edge_insert_count;
         std::atomic<int64_t> edge_lock_wait_ns;
         std::atomic<int64_t> edge_lock_contention_count;
+        std::atomic<uint32_t> processed_leaves;
+        std::vector<uint32_t> membership_counts;
+        std::vector<std::vector<uint32_t>> point_to_leaf_ids;
+        const std::vector<Leaf>* leaves = nullptr;
+        RbcCoverageStats rbc_coverage;
+        QualityProbeStats quality_probe;
     };
+
+    static RbcCoverageStats
+    collect_rbc_coverage_stats(const std::vector<Leaf>& leaves, uint32_t n);
+
+    void
+    collect_pre_final_retained_probe_stats(const float* data, uint32_t n, uint32_t dim, BuildContext& context) const;
+
+    static void
+    log_quality_probe_stats(const BuildContext& context, bool final_prune_enabled);
 
     void
     process_leaf(const float* data, uint32_t dim, const Leaf& leaf, BuildContext& context) const;
 
     void
-    robust_prune_pass(const float* data, uint32_t n, uint32_t dim, std::vector<std::vector<uint32_t>>& adjacency) const;
+    robust_prune_pass(const float* data, uint32_t n, uint32_t dim, std::vector<std::vector<uint32_t>>& adjacency,
+                      BuildContext& context) const;
 
     static float
     l2sq(const float* a, const float* b, uint32_t dim);

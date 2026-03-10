@@ -14,12 +14,16 @@
 #include "knowhere/feder/DiskANN.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <string_view>
 
 #include "diskann/aux_utils.h"
 #include "diskann/linux_aligned_file_reader.h"
+#include "diskann/partition_and_pq.h"
 #include "diskann/pq_flash_index.h"
 #include "filemanager/FileManager.h"
 #include "fmt/core.h"
@@ -280,6 +284,127 @@ CheckMetric(const std::string& diskann_metric) {
         return true;
     }
 }
+
+inline bool
+ShouldForceDiskANNBuildIndex() {
+    const char* raw = std::getenv("KNOWHERE_PIPNN_FORCE_DISKANN_BUILD_INDEX");
+    return raw != nullptr && raw[0] != '\0' && std::string_view(raw) != "0";
+}
+
+template <typename DataType>
+int
+BuildDiskIndexPostprocessOnly(const diskann::BuildConfig& config) {
+    const _u32 disk_pq_dims = config.disk_pq_dims;
+    const bool use_disk_pq = disk_pq_dims != 0;
+    const bool reorder_data = config.reorder;
+
+    std::string base_file = config.data_file_path;
+    std::string data_file_to_use = base_file;
+    std::string data_file_to_save = base_file;
+    std::string index_prefix_path = config.index_file_path;
+    std::string pq_pivots_path = diskann::get_pq_pivots_filename(index_prefix_path);
+    std::string pq_compressed_vectors_path = diskann::get_pq_compressed_filename(index_prefix_path);
+    std::string mem_index_path = index_prefix_path + "_mem.index";
+    std::string disk_index_path = diskann::get_disk_index_filename(index_prefix_path);
+    std::string sample_data_file = diskann::get_sample_data_filename(index_prefix_path);
+    std::string disk_pq_pivots_path = index_prefix_path + "_disk.index_pq_pivots.bin";
+    std::string disk_pq_compressed_vectors_path = index_prefix_path + "_disk.index_pq_compressed.bin";
+
+    if (config.compare_metric == diskann::Metric::INNER_PRODUCT) {
+        std::string prepped_base = index_prefix_path + "_prepped_base.bin";
+        data_file_to_use = prepped_base;
+        data_file_to_save = prepped_base;
+        float max_norm_of_base = diskann::prepare_base_for_inner_products<DataType>(base_file, prepped_base);
+        std::string norm_file = diskann::get_disk_index_max_base_norm_file(disk_index_path);
+        diskann::save_bin<float>(norm_file, &max_norm_of_base, 1, 1);
+    }
+    if (config.compare_metric == diskann::Metric::COSINE) {
+        std::string prepped_base = index_prefix_path + "_prepped_base.bin";
+        data_file_to_use = prepped_base;
+        auto norms_of_base = diskann::prepare_base_for_cosine<DataType>(base_file, prepped_base);
+        std::string norm_file = diskann::get_disk_index_max_base_norm_file(disk_index_path);
+        diskann::save_bin<float>(norm_file, norms_of_base.data(), norms_of_base.size(), 1);
+    }
+
+    size_t points_num, dim;
+    diskann::get_bin_metadata(data_file_to_use.c_str(), points_num, dim);
+
+    const double pq_code_size_limit = diskann::get_memory_budget(config.pq_code_size_gb);
+    size_t num_pq_chunks = static_cast<size_t>(std::floor(static_cast<_u64>(pq_code_size_limit / points_num)));
+    num_pq_chunks = num_pq_chunks <= 0 ? 1 : num_pq_chunks;
+    num_pq_chunks = num_pq_chunks > dim ? dim : num_pq_chunks;
+    num_pq_chunks =
+        num_pq_chunks > diskann::defaults::MAX_PQ_CHUNKS ? diskann::defaults::MAX_PQ_CHUNKS : num_pq_chunks;
+
+    size_t train_size, train_dim;
+    std::unique_ptr<float[]> train_data = nullptr;
+    const double p_val = static_cast<double>(diskann::MAX_PQ_TRAINING_SET_SIZE) / static_cast<double>(points_num);
+    gen_random_slice<DataType>(data_file_to_use.c_str(), p_val, train_data, train_size, train_dim);
+
+    if (use_disk_pq) {
+        auto effective_disk_pq_dims = disk_pq_dims;
+        if (effective_disk_pq_dims > dim) {
+            effective_disk_pq_dims = static_cast<_u32>(dim);
+        }
+        generate_pq_pivots(train_data.get(), train_size, static_cast<uint32_t>(dim), 256,
+                                    static_cast<uint32_t>(effective_disk_pq_dims), diskann::NUM_KMEANS_REPS,
+                                    disk_pq_pivots_path, false);
+        if (config.compare_metric == diskann::Metric::INNER_PRODUCT || config.compare_metric == diskann::Metric::COSINE) {
+            generate_pq_data_from_pivots<float>(data_file_to_use.c_str(), 256,
+                                                         static_cast<uint32_t>(effective_disk_pq_dims),
+                                                         disk_pq_pivots_path, disk_pq_compressed_vectors_path);
+        } else {
+            generate_pq_data_from_pivots<DataType>(data_file_to_use.c_str(), 256,
+                                                            static_cast<uint32_t>(effective_disk_pq_dims),
+                                                            disk_pq_pivots_path, disk_pq_compressed_vectors_path);
+        }
+    }
+
+    const bool make_zero_mean = config.compare_metric == diskann::Metric::L2;
+    generate_pq_pivots(train_data.get(), train_size, static_cast<uint32_t>(dim), 256,
+                                static_cast<uint32_t>(num_pq_chunks), diskann::NUM_KMEANS_REPS, pq_pivots_path,
+                                make_zero_mean);
+    generate_pq_data_from_pivots<DataType>(data_file_to_use.c_str(), 256, static_cast<uint32_t>(num_pq_chunks),
+                                                    pq_pivots_path, pq_compressed_vectors_path);
+
+    // Keep vendored DiskANN untouched in FIX-002. Until the cross-TU
+    // create_aisaq_layout signatures are reconciled, the PiPNN
+    // postprocess-only path falls back to the standard disk layout so we can
+    // unblock Debug build/e2e verification first.
+    if (config.aisaq_mode) {
+        LOG_KNOWHERE_WARNING_ << "PiPNN postprocess-only fallback: aisaq_mode requested but create_aisaq_layout "
+                              << "is disabled for compatibility; fallback to create_disk_layout.";
+    }
+
+    {
+        if (!use_disk_pq) {
+            diskann::create_disk_layout<DataType>(data_file_to_save.c_str(), mem_index_path, disk_index_path);
+        } else {
+            if (!reorder_data) {
+                diskann::create_disk_layout<_u8>(disk_pq_compressed_vectors_path, mem_index_path, disk_index_path);
+            } else {
+                diskann::create_disk_layout<_u8>(disk_pq_compressed_vectors_path, mem_index_path, disk_index_path,
+                                                 data_file_to_save.c_str());
+            }
+        }
+    }
+
+    const double ten_percent_points = std::ceil(points_num * 0.1);
+    const double num_sample_points = ten_percent_points > diskann::MAX_SAMPLE_POINTS_FOR_WARMUP
+                                         ? diskann::MAX_SAMPLE_POINTS_FOR_WARMUP
+                                         : ten_percent_points;
+    const double sample_sampling_rate = num_sample_points / points_num;
+    gen_random_slice<DataType>(base_file.c_str(), sample_data_file, sample_sampling_rate);
+
+    if (config.compare_metric == diskann::Metric::INNER_PRODUCT || config.compare_metric == diskann::Metric::COSINE) {
+        std::remove(data_file_to_use.c_str());
+    }
+    if (use_disk_pq) {
+        std::remove(disk_pq_compressed_vectors_path.c_str());
+    }
+
+    return 0;
+}
 }  // namespace
 
 template <typename DataType>
@@ -402,10 +527,23 @@ PiPNNDiskANNIndexNode<DataType>::Build(const DataSetPtr dataset, std::shared_ptr
                                                        static_cast<uint32_t>(num_nodes_to_cache),
                                                        build_conf.shuffle_build.value()};
     const auto pq_stage_start = clock::now();
+    const bool force_diskann_build_index = ShouldForceDiskANNBuildIndex();
+    const char* build_mode = force_diskann_build_index ? "force_diskann_build_index" : "postprocess_only";
+    if (force_diskann_build_index) {
+        LOG_KNOWHERE_WARNING_ << "[PiPNN Profiling] Diagnostic mode enabled: force DiskANN build_disk_index for "
+                                 "recall triage instead of PiPNN postprocess-only path. mode="
+                              << build_mode;
+    } else {
+        LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Reusing prebuilt _mem.index for postprocess; skip DiskANN graph rebuild. mode="
+                           << build_mode;
+    }
     RETURN_IF_ERROR(TryDiskANNCall([&]() {
-        int res = diskann::build_disk_index<DataType>(diskann_internal_build_config);
+        int res = force_diskann_build_index ? diskann::build_disk_index<DataType>(diskann_internal_build_config)
+                                            : BuildDiskIndexPostprocessOnly<DataType>(diskann_internal_build_config);
         if (res != 0) {
-            throw diskann::ANNException("diskann::build_disk_index returned non-zero value: " + std::to_string(res),
+            throw diskann::ANNException(std::string(force_diskann_build_index ? "build_disk_index" :
+                                                                                 "BuildDiskIndexPostprocessOnly") +
+                                            " returned non-zero value: " + std::to_string(res),
                                         -1);
         }
     }));
@@ -414,11 +552,11 @@ PiPNNDiskANNIndexNode<DataType>::Build(const DataSetPtr dataset, std::shared_ptr
     LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Build stage: "
                        << build_profile.stage_ms(pipnn_diskann::BuildStage::kPQAndDiskLayout) << " ms ("
                        << pipnn_diskann::BuildStageName(pipnn_diskann::BuildStage::kPQAndDiskLayout)
-                       << ", num_points=" << count << ", dim=" << dim << ")";
+                       << ", mode=" << build_mode << ", num_points=" << count << ", dim=" << dim << ")";
     LOG_KNOWHERE_INFO_ << "[PiPNN Profiling] Build stage: "
                        << build_profile.stage_ms(pipnn_diskann::BuildStage::kTotal) << " ms ("
                        << pipnn_diskann::BuildStageName(pipnn_diskann::BuildStage::kTotal)
-                       << ", graph_pct=" << (build_profile.total_ns() == 0
+                       << ", mode=" << build_mode << ", graph_pct=" << (build_profile.total_ns() == 0
                                                  ? 0.0
                                                  : 100.0 * static_cast<double>(build_profile.graph_construction_ns) /
                                                        static_cast<double>(build_profile.total_ns()))
@@ -441,7 +579,16 @@ PiPNNDiskANNIndexNode<DataType>::Build(const DataSetPtr dataset, std::shared_ptr
         }
     }
 
+    // Keep Build->Search lifecycle consistent for postprocess-only and regular
+    // pipelines: eagerly prepare PQFlashIndex right after files are generated.
+    // This also keeps existing Deserialize-based callers compatible because
+    // Deserialize() will fast-return when is_prepared_ is already true.
     is_prepared_.store(false);
+    auto prepare_status = Deserialize(BinarySet{}, cfg);
+    if (prepare_status != Status::success) {
+        LOG_KNOWHERE_ERROR_ << "PiPNN-DiskANN build completed but eager prepare failed.";
+        return prepare_status;
+    }
     return Status::success;
 }
 
@@ -457,7 +604,11 @@ PiPNNDiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, std::share
 
     std::lock_guard<std::mutex> lock(preparation_lock_);
     if (is_prepared_.load()) {
-        return Status::success;
+        if (pq_flash_index_ && search_pool_) {
+            return Status::success;
+        }
+        LOG_KNOWHERE_WARNING_ << "PiPNN-DiskANN prepare state is inconsistent; force reloading index artifacts.";
+        is_prepared_.store(false);
     }
     if (!(prep_conf.index_prefix.has_value())) {
         LOG_KNOWHERE_ERROR_ << "PiPNN-DiskANN file path for deserialize is empty.";
@@ -468,6 +619,9 @@ PiPNNDiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, std::share
     bool is_ip = IsMetricType(prep_conf.metric_type.value(), knowhere::metric::IP);
     bool need_norm = IsMetricType(prep_conf.metric_type.value(), knowhere::metric::IP) ||
                      IsMetricType(prep_conf.metric_type.value(), knowhere::metric::COSINE);
+    bool use_sample_cache = prep_conf.search_cache_budget_gb.value() > 0 && !prep_conf.use_bfs_cache.value();
+    bool use_sample_warmup = prep_conf.warm_up.value();
+    auto sample_data_file = diskann::get_sample_data_filename(index_prefix_);
     auto diskann_metric = [m = prep_conf.metric_type.value()] {
         if (IsMetricType(m, knowhere::metric::L2)) {
             return diskann::Metric::L2;
@@ -478,10 +632,17 @@ PiPNNDiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, std::share
         }
     }();
 
-    for (auto& filename : GetNecessaryFilenames(
-             index_prefix_, need_norm, prep_conf.search_cache_budget_gb.value() > 0 && !prep_conf.use_bfs_cache.value(),
-             prep_conf.warm_up.value())) {
+    for (auto& filename : GetNecessaryFilenames(index_prefix_, need_norm, use_sample_cache, use_sample_warmup)) {
         if (!LoadFile(filename)) {
+            if (filename == sample_data_file && (use_sample_cache || use_sample_warmup)) {
+                LOG_KNOWHERE_WARNING_ << "PiPNN-DiskANN sample data file is missing, disable sample cache/warmup fallback. file="
+                                      << filename;
+                use_sample_cache = false;
+                use_sample_warmup = false;
+                continue;
+            }
+            LOG_KNOWHERE_ERROR_ << "PiPNN-DiskANN deserialize failed while loading required file. stage=load_required_file, file="
+                                << filename;
             return Status::disk_file_error;
         }
     }
@@ -492,6 +653,8 @@ PiPNNDiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, std::share
             return Status::disk_file_error;
         }
         if (is_exist_op.value() && !LoadFile(filename)) {
+            LOG_KNOWHERE_ERROR_ << "PiPNN-DiskANN deserialize failed while loading optional file. stage=load_optional_file, file="
+                                << filename;
             return Status::disk_file_error;
         }
     }
@@ -509,7 +672,7 @@ PiPNNDiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, std::share
         }
     };
     if (TryDiskANNCall(disk_ann_call) != Status::success) {
-        LOG_KNOWHERE_ERROR_ << "Failed to load PiPNN-DiskANN.";
+        LOG_KNOWHERE_ERROR_ << "Failed to load PiPNN-DiskANN. stage=pq_flash_index_load, prefix=" << index_prefix_;
         return Status::diskann_inner_error;
     }
 
@@ -548,12 +711,19 @@ PiPNNDiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, std::share
                 }
             } else {
                 LOG_KNOWHERE_INFO_ << "Use sample_queries to generate cache list";
-                if (TryDiskANNCall([&]() {
+                if (!use_sample_cache) {
+                    LOG_KNOWHERE_WARNING_ << "Skip sample-query cache generation because sample data is unavailable.";
+                } else {
+                    const auto sample_cache_status = TryDiskANNCall([&]() {
                         pq_flash_index_->async_generate_cache_list_from_sample_queries(warmup_query_file, 15, 6,
                                                                                        num_nodes_to_cache);
-                    }) != Status::success) {
-                    LOG_KNOWHERE_ERROR_ << "Failed to generate cache from sample queries for PiPNN-DiskANN.";
-                    return Status::diskann_inner_error;
+                    });
+                    if (sample_cache_status != Status::success) {
+                        LOG_KNOWHERE_WARNING_
+                            << "PiPNN-DiskANN sample-query cache generation failed; disable sample cache fallback and continue. "
+                            << "stage=sample_query_cache, file=" << warmup_query_file;
+                        use_sample_cache = false;
+                    }
                 }
             }
         }
@@ -567,42 +737,51 @@ PiPNNDiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, std::share
         }
     }
 
-    if (prep_conf.warm_up.value()) {
+    if (use_sample_warmup) {
         LOG_KNOWHERE_INFO_ << "Warming up.";
         uint64_t warmup_L = 20;
         uint64_t warmup_num = 0;
         uint64_t warmup_dim = 0;
         uint64_t warmup_aligned_dim = 0;
         DataType* warmup = nullptr;
-        if (TryDiskANNCall([&]() {
-                diskann::load_aligned_bin<DataType>(warmup_query_file, warmup, warmup_num, warmup_dim,
-                                                    warmup_aligned_dim);
-            }) != Status::success) {
-            LOG_KNOWHERE_ERROR_ << "Failed to load warmup file for PiPNN-DiskANN.";
-            return Status::disk_file_error;
-        }
-        std::vector<int64_t> warmup_result_ids_64(warmup_num, 0);
-        std::vector<DistType> warmup_result_dists(warmup_num, 0);
-
-        std::vector<folly::Future<folly::Unit>> futures;
-        futures.reserve(warmup_num);
-        for (_s64 i = 0; i < (int64_t)warmup_num; ++i) {
-            futures.emplace_back(search_pool_->push([&, index = i]() {
-                pq_flash_index_->cached_beam_search(warmup + (index * warmup_aligned_dim), 1, warmup_L,
-                                                    warmup_result_ids_64.data() + (index * 1),
-                                                    warmup_result_dists.data() + (index * 1), 4);
-            }));
+        const auto warmup_load_status = TryDiskANNCall([&]() {
+            diskann::load_aligned_bin<DataType>(warmup_query_file, warmup, warmup_num, warmup_dim, warmup_aligned_dim);
+        });
+        if (warmup_load_status != Status::success) {
+            LOG_KNOWHERE_WARNING_ << "PiPNN-DiskANN warmup sample load failed; skip warmup and continue. stage=warmup_load, file="
+                                  << warmup_query_file;
+            use_sample_warmup = false;
         }
 
-        bool failed = TryDiskANNCall([&]() { WaitAllSuccess(futures); }) != Status::success;
+        if (use_sample_warmup) {
+            std::vector<int64_t> warmup_result_ids_64(warmup_num, 0);
+            std::vector<DistType> warmup_result_dists(warmup_num, 0);
+
+            std::vector<folly::Future<folly::Unit>> futures;
+            futures.reserve(warmup_num);
+            for (_s64 i = 0; i < (int64_t)warmup_num; ++i) {
+                futures.emplace_back(search_pool_->push([&, index = i]() {
+                    pq_flash_index_->cached_beam_search(warmup + (index * warmup_aligned_dim), 1, warmup_L,
+                                                        warmup_result_ids_64.data() + (index * 1),
+                                                        warmup_result_dists.data() + (index * 1), 4);
+                }));
+            }
+
+            bool failed = TryDiskANNCall([&]() { WaitAllSuccess(futures); }) != Status::success;
+
+            if (warmup != nullptr) {
+                diskann::aligned_free(warmup);
+                warmup = nullptr;
+            }
+
+            if (failed) {
+                LOG_KNOWHERE_WARNING_ << "PiPNN-DiskANN warmup search failed; skip warmup and continue. stage=warmup_search, file="
+                                      << warmup_query_file;
+            }
+        }
 
         if (warmup != nullptr) {
             diskann::aligned_free(warmup);
-        }
-
-        if (failed) {
-            LOG_KNOWHERE_ERROR_ << "Failed to do search on warmup file for PiPNN-DiskANN.";
-            return Status::diskann_inner_error;
         }
     }
 
@@ -615,12 +794,26 @@ template <typename DataType>
 expected<DataSetPtr>
 PiPNNDiskANNIndexNode<DataType>::Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg,
                                         const BitsetView& bitset_, milvus::OpContext* op_context) const {
-    if (!is_prepared_.load() || !pq_flash_index_) {
-        LOG_KNOWHERE_ERROR_ << "Failed to load PiPNN-DiskANN.";
-        return expected<DataSetPtr>::Err(Status::empty_index, "PiPNNDiskANN not loaded");
-    }
-
     auto search_conf = static_cast<const PiPNNDiskANNConfig&>(*cfg);
+
+    if (!is_prepared_.load() || !pq_flash_index_ || !search_pool_) {
+        std::string prepare_index_prefix = index_prefix_;
+        if (search_conf.index_prefix.has_value()) {
+            prepare_index_prefix = search_conf.index_prefix.value();
+        }
+        if (prepare_index_prefix.empty()) {
+            LOG_KNOWHERE_ERROR_ << "Failed to load PiPNN-DiskANN.";
+            return expected<DataSetPtr>::Err(Status::empty_index, "PiPNNDiskANN not loaded");
+        }
+
+        auto prepare_cfg = std::make_shared<PiPNNDiskANNConfig>(search_conf);
+        prepare_cfg->index_prefix = prepare_index_prefix;
+        auto prepare_status = const_cast<PiPNNDiskANNIndexNode<DataType>*>(this)->Deserialize(BinarySet{}, prepare_cfg);
+        if (prepare_status != Status::success || !is_prepared_.load() || !pq_flash_index_ || !search_pool_) {
+            LOG_KNOWHERE_ERROR_ << "Failed to load PiPNN-DiskANN.";
+            return expected<DataSetPtr>::Err(Status::empty_index, "PiPNNDiskANN not loaded");
+        }
+    }
     if (!CheckMetric(search_conf.metric_type.value())) {
         return expected<DataSetPtr>::Err(Status::invalid_metric_type, "unsupported metric type");
     }
