@@ -143,15 +143,15 @@ printf 'log=%s\n' "${log_file}"
 EOF
         ;;
     test)
-        run_remote_script "${BUILD_TYPE}" "${FILTER}" "${LABEL}" "${REMOTE_REPO_DIR}" "${REMOTE_LOG_DIR}" "${#ENV_VARS[@]}" "${ENV_VARS[@]}" <<'EOF'
+        run_remote_script "${BUILD_TYPE}" "${FILTER:-[pipnn]}" "${REMOTE_REPO_DIR}" "${REMOTE_LOG_DIR}" "${#ENV_VARS[@]}" "${LABEL:-__none__}" ${ENV_VARS[@]+"${ENV_VARS[@]}"} <<'EOF'
 set -euo pipefail
 
 build_type="$1"
 filter="$2"
-label="$3"
-repo_dir="$4"
-log_dir="$5"
-env_count="$6"
+repo_dir="$3"
+log_dir="$4"
+env_count="$5"
+label="${6:-__none__}"
 shift 6
 
 for ((i = 0; i < env_count; ++i)); do
@@ -172,13 +172,15 @@ fi
 
 mkdir -p "${log_dir}"
 log_prefix="test_bg"
-if [[ -n "${label}" ]]; then
+if [[ -n "${label}" && "${label}" != "__none__" ]]; then
     log_prefix="test_${label}"
 fi
 log_file="${log_dir}/${log_prefix}_$(date -u +%Y%m%dT%H%M%SZ).log"
 cmd=$(cat <<CMD
+export TMPDIR="/data/tmp"
+mkdir -p "/data/tmp"
 cd "${repo_dir}/build/${build_type}"
-"${test_bin}" "${filter:-[pipnn]}"
+"${test_bin}" "${filter}"
 CMD
 )
 nohup bash -lc "${cmd}" >"${log_file}" 2>&1 </dev/null &
